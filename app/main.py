@@ -36,8 +36,19 @@ async def websocket_endpoint(ws: WebSocket):
     logger.info("WebSocket connection established")
     try:
         while True:
-            data = await ws.receive_text()
-            logger.info(f"data is {data}")
-            await ws.send_text(f"Message text was: {data}")
+            # <-- parse directement en dict Python
+            payload = await ws.receive_json()
+
+            # payload ressemble à {"front": 12.3, "left": 10000, ...}
+            # log concis pour éviter d’inonder la console
+            # (si tu veux tout voir: logger.info(payload))
+            min_name, min_dist = min(payload.items(), key=lambda kv: kv[1])
+            logger.info(f"min distance: {min_dist:.3f} ({min_name})")
+
+            # renvoie un message utile au front
+            await ws.send_json({
+                "min": {"name": min_name, "distance": min_dist},
+                "all": payload  # enlève en prod si trop verbeux
+            })
     except Exception as e:
         logger.warning(f"WebSocket closed: {e}")
