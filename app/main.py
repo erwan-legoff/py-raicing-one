@@ -40,31 +40,10 @@ logger.info(f"🖥️  Using device: {device} on torch {torch.__version__}")
 async def root():
     return {"message": "Hello World"}
 
-@app.websocket("/ai")
-async def websocket_endpoint(ws: WebSocket):
-    await ws.accept()
-    logger.info("WebSocket connection established")
-    try:
-        while True:
-            # <-- parse directement en dict Python
-            payload = await ws.receive_json()
 
-            # payload ressemble à {"front": 12.3, "left": 10000, ...}
-            # log concis pour éviter d’inonder la console
-            # (si tu veux tout voir: logger.info(payload))
-            min_name, min_dist = min(payload.items(), key=lambda kv: kv[1])
-            logger.info(f"min distance: {min_dist:.3f} ({min_name})")
-
-            # renvoie un message utile au front
-            await ws.send_json({
-                "min": {"name": min_name, "distance": min_dist},
-                "all": payload  # enlève en prod si trop verbeux
-            })
-    except Exception as e:
-        logger.warning(f"WebSocket closed: {e}")
 
 # NN Module
-class NeuralNetwork(nn.Module):
+class AutoPilot(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
         self.input_layer = nn.Linear(input_size,hidden_size, device=device)
@@ -88,11 +67,42 @@ class NeuralNetwork(nn.Module):
 input_size = 7
 hidden_size = 128
 output_size = 4
+order = [
+    "left45Ray",
+    "left22Ray",
+    "leftNarrowRay",
+    "frontRay",
+    "rightNarrowRay",
+    "right22Ray",
+    "right45Ray"
+]
 
-model = NeuralNetwork(input_size,hidden_size,output_size)
-x = torch.zeros((1, input_size), device=device)
-y = model(x)
-print(y.shape)
+auto_pilot = AutoPilot(input_size,hidden_size,output_size)
+auto_pilot.to(device)
+driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
+@app.websocket("/ai")
+async def websocket_endpoint(ws: WebSocket):
+    await ws.accept()
+    logger.info("WebSocket connection established")
+    try:
+        while True:
+            # <-- parse directement en dict Python
+            payload = await ws.receive_json()
+            values = [payload[k] for k in order if k in payload]
+            # payload ressemble à {"front": 12.3, "left": 10000, ...}
+            data_input = torch.tensor([values], dtype=torch.float32, device=device)
+            driving_input_logits = auto_pilot(data_input)
+            driving_input_probabilities = torch.sigmoid(driving_input_logits)
+            driving_input_ids = (driving_input_probabilities > 0.66).int()[0].tolist()
+            with torch.no_grad():
+                driving_inputs_chosen = [driving_inputs[i] for i,v in enumerate(driving_input_ids) if v == 1]
+
+            # renvoie un message utile au front
+            await ws.send_json({
+                "driving_inputs": driving_inputs_chosen,
+            })
+    except Exception as e:
+        logger.warning(f"WebSocket closed: {e}")
 
 
         
