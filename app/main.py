@@ -88,6 +88,7 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             # <-- parse directement en dict Python
             payload = await ws.receive_json()
+            logger.info(f"driving world : {payload}")
             values = [payload[k] for k in order if k in payload]
             # payload ressemble à {"front": 12.3, "left": 10000, ...}
             data_input = torch.tensor([values], dtype=torch.float32, device=device)
@@ -96,7 +97,7 @@ async def websocket_endpoint(ws: WebSocket):
             driving_input_ids = (driving_input_probabilities > 0.66).int()[0].tolist()
             with torch.no_grad():
                 driving_inputs_chosen = [driving_inputs[i] for i,v in enumerate(driving_input_ids) if v == 1]
-
+            logger.info(f"driving inputs : {driving_inputs_chosen}")
             # renvoie un message utile au front
             await ws.send_json({
                 "driving_inputs": driving_inputs_chosen,
