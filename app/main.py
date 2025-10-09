@@ -34,7 +34,7 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-logger.info(f"🖥️  Using device: {device}")
+logger.info(f"🖥️  Using device: {device} on torch {torch.__version__}")
 
 @app.get("/")
 async def root():
@@ -62,3 +62,37 @@ async def websocket_endpoint(ws: WebSocket):
             })
     except Exception as e:
         logger.warning(f"WebSocket closed: {e}")
+
+# NN Module
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super().__init__()
+        self.input_layer = nn.Linear(input_size,hidden_size, device=device)
+        self.non_linear_1 = nn.ReLU()
+        self.hidden_layer_1 = nn.Linear(hidden_size,hidden_size, device=device)
+        self.non_linear_2 = nn.ReLU()
+        self.hidden_layer_2 = nn.Linear(hidden_size,hidden_size//2, device=device)
+        self.non_linear_3 = nn.ReLU()
+        self.output_layer = nn.Linear(hidden_size//2,output_size, device=device)
+
+    def forward(self, inputs):
+        inputs = self.input_layer(inputs)
+        inputs = self.non_linear_1(inputs)
+        inputs = self.hidden_layer_1(inputs)
+        inputs = self.non_linear_2(inputs)
+        inputs = self.hidden_layer_2(inputs)
+        inputs = self.non_linear_3(inputs)
+        inputs = self.output_layer(inputs)
+        return inputs
+    
+input_size = 7
+hidden_size = 128
+output_size = 4
+
+model = NeuralNetwork(input_size,hidden_size,output_size)
+x = torch.zeros((1, input_size), device=device)
+y = model(x)
+print(y.shape)
+
+
+        
