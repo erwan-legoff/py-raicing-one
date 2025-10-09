@@ -64,17 +64,17 @@ class AutoPilot(nn.Module):
         inputs = self.output_layer(inputs)
         return inputs
     
-input_size = 7
+input_size = 13  # 7 capteurs + 3 vitesses + 3 accélérations
 hidden_size = 128
 output_size = 4
-order = [
+sensor_order = [
     "left45Ray",
     "left22Ray",
     "leftNarrowRay",
     "frontRay",
     "rightNarrowRay",
     "right22Ray",
-    "right45Ray"
+    "right45Ray",
 ]
 
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
@@ -83,27 +83,43 @@ driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 @app.websocket("/ai")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    logger.info("WebSocket connection established")
+    logger.info("✅ WebSocket connection established")
+
     try:
         while True:
-            # <-- parse directement en dict Python
             payload = await ws.receive_json()
-            logger.info(f"driving world : {payload}")
-            values = [payload[k] for k in order if k in payload]
-            # payload ressemble à {"front": 12.3, "left": 10000, ...}
+            # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
+
+            sensors = payload.get("sensors", {})
+            speeds = payload.get("speeds", {})
+            accels = payload.get("accelerations", {})
+
+            # 1️⃣ Distances dans l’ordre défini
+            sensor_values = [sensors.get(k, 0.0) for k in sensor_order]
+
+            # 2️⃣ Vitesses et accélérations (x, y, z)
+            speed_values = [speeds.get(axis, 0.0) for axis in ("x", "y", "z")]
+            accel_values = [accels.get(axis, 0.0) for axis in ("x", "y", "z")]
+
+            # 3️⃣ Fusion complète : [7 capteurs] + [3 vitesses] + [3 accels] = 13 features
+            values = sensor_values + speed_values + accel_values
+
             data_input = torch.tensor([values], dtype=torch.float32, device=device)
-            driving_input_logits = auto_pilot(data_input)
-            driving_input_probabilities = torch.sigmoid(driving_input_logits)
-            driving_input_ids = (driving_input_probabilities > 0.66).int()[0].tolist()
+
             with torch.no_grad():
-                driving_inputs_chosen = [driving_inputs[i] for i,v in enumerate(driving_input_ids) if v == 1]
-            logger.info(f"driving inputs : {driving_inputs_chosen}")
-            # renvoie un message utile au front
-            await ws.send_json({
-                "driving_inputs": driving_inputs_chosen,
-            })
+                logits = auto_pilot(data_input)
+                probs = torch.sigmoid(logits)
+                active = (probs > 0.66).int()[0].tolist()
+                chosen = [driving_inputs[i] for i, v in enumerate(active) if v == 1]
+
+            logger.info(f"Inputs: {[int(v) for v in values]}")
+
+            logger.info(f"Actions: {chosen}")
+
+            await ws.send_json({"driving_inputs": chosen})
+
     except Exception as e:
-        logger.warning(f"WebSocket closed: {e}")
+        logger.warning(f"⚠️ WebSocket closed: {e}")
 
 
         
