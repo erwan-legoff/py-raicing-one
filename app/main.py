@@ -369,8 +369,8 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("✅ WebSocket connection established")
-    prediction_seconds_before_learning = 15
-    fps = 60
+    prediction_seconds_before_learning = 120
+    fps = 30
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     predictions_count: int = 0
     try:
@@ -404,6 +404,7 @@ def predict_actions(payload, i = 0):
         reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
         # Log reward seulement toutes les 10 frames pour réduire le bruit
         if frame_idx % 10 == 0:
+            logger.info(f"Frame {frame_idx}")
             logger.info(f"👌Reward: {reward:.2f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
