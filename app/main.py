@@ -141,11 +141,15 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         prev_pos = previous.result.get("positions", {}).get("car", {})
         curr_pos = current.world.get("positions", {}).get("car", {})
         left_sensor = current.world.get("sensors",{}).get("left45Ray",  0)
-        right_sensor = current.world.get("sensors",{}).get("left45Ray",  0)
+        right_sensor = current.world.get("sensors", {}).get("right45Ray", 0)
         curr_z_speed = -float(current.world.get("speeds", {}).get("z", 0.0))
+        curr_y_speed = -float(current.world.get("speeds", {}).get("y", 0.0))
         curr_x_speed = -float(current.world.get("speeds", {}).get("x", 0.0))
         road_pos = current.world.get("positions", {}).get("road", {})
-        
+        # Avancement positif sur Z (plus on va loin, mieux c’est)
+        prev_z = prev_pos.get("z", 0.0)
+        curr_z = curr_pos.get("z", 0.0)
+        curr_y = curr_pos.get("y", 0.0)
         
         # Vérifie que les positions sont valides
         if not curr_pos or not prev_pos:
@@ -161,24 +165,21 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         if(right_sensor < 0.1):
             return -curr_x_speed*5
 
-        # Avancement positif sur Z (plus on va loin, mieux c’est)
-        prev_z = prev_pos.get("z", 0.0)
-        curr_z = curr_pos.get("z", 0.0)
+        
         # Reward = distance parcourue vers l’avant * facteur de gain
-        if(curr_z_speed < 0.2 and curr_z_speed >= -1):
+        if(curr_z_speed < 0.2 and curr_z_speed >= -1 and curr_y < 0.1 and curr_y_speed >= 0):
             return -10
         if(curr_z_speed < 0):
             return 10 * curr_z_speed
-        reward = curr_z_speed - curr_z
+        reward = -curr_z_speed * curr_z
         return reward
 import math
 import torch.optim as optim
 optimizer = optim.Adam(auto_pilot.parameters(), lr=1e-4)
-def get_action_log_probability(actions, probabilities):
-    eps = 1e-8
-    clipped_probs = torch.clamp(probabilities, eps, 1 - eps)
-    log_probs = torch.log(clipped_probs) * actions 
-    return log_probs.sum(dim=1)
+from torch.distributions import Bernoulli
+def get_action_log_probability(actions, logits):
+    dist = Bernoulli(logits=logits)   
+    return dist.log_prob(actions).sum(dim=1, keepdim=True) 
 
 
 SENSOR_MIN = 0.0
@@ -205,53 +206,118 @@ def normalize_inputs(values: list[float]) -> torch.Tensor:
     # Clamp par sécurité
     return torch.clamp(normalized, 0.0, 1.0)
 
+def process_rewards(simulation_history: list[HistoryPoint]) -> torch.Tensor:
+    """Nettoie, normalise et logge les rewards pour le training."""
+    raw_rewards = [h.reward for h in simulation_history]
+    rewards = torch.tensor(raw_rewards, dtype=torch.float32, device=device)
 
-def train(batch_size= 64, save_every=1000, resume: bool = True):
-    
+    if len(rewards) == 0:
+        logger.warning("⚠️ Aucun reward trouvé — impossible d'entraîner.")
+        return rewards
+
+    # 🧮 Log initial des rewards bruts
+    logger.info(
+        f"🎯 Rewards (raw): min={rewards.min().item():.3f}, "
+        f"max={rewards.max().item():.3f}, "
+        f"mean={rewards.mean().item():.3f}, "
+        f"std={rewards.std().item():.3f}"
+    )
+
+    # 1️⃣ Clipping des extrêmes pour éviter explosions
+    rewards = torch.clamp(rewards, -50, 50)
+
+    # 2️⃣ Mise à l’échelle douce [-1,1] via tanh
+    rewards = torch.tanh(rewards / 20.0)
+
+    # 📈 Log après mise à l’échelle
+    logger.info(
+        f"📈 Rewards (tanh-scaled): min={rewards.min().item():.3f}, "
+        f"max={rewards.max().item():.3f}, "
+        f"mean={rewards.mean().item():.3f}, "
+        f"std={rewards.std().item():.3f}"
+    )
+
+    # 3️⃣ Normalisation globale (centrage + écart-type)
+    rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+
+    # 📊 Log final des rewards normalisés
+    logger.info(
+        f"📊 Rewards (normalized): min={rewards.min().item():.3f}, "
+        f"max={rewards.max().item():.3f}, "
+        f"mean={rewards.mean().item():.3f}, "
+        f"std={rewards.std().item():.3f}"
+    )
+
+    return rewards
+
+
+
+def train(batch_size=64, save_every=1000, resume: bool = True):
     if resume:
         loaded = load_latest_model(auto_pilot)
         if loaded:
             logger.info("🔄 Modèle existant chargé, reprise de l'entraînement.")
         else:
             logger.info("🆕 Aucun modèle trouvé — entraînement à partir de zéro.")
-    inputs = torch.tensor([h.input for h in simulation_history], dtype=torch.float32, device=device)
+
+    inputs = torch.stack([normalize_inputs(h.input) for h in simulation_history]).to(device)
     tries = torch.tensor([h.output for h in simulation_history], dtype=torch.float32, device=device)
-    rewards = torch.tensor([h.reward for h in simulation_history], dtype=torch.float32, device=device)
+    rewards = process_rewards(simulation_history)  # <---- nouvelle fonction ici
+
     num_batches = math.ceil(len(inputs) / batch_size)
     logger.info(f"🧮 Début entraînement sur {len(inputs)} transitions ({num_batches} batchs)")
-    logger.info("🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️")
+    logger.info("🖥️" * 30)
     auto_pilot.train()
+
     for batch_id in range(num_batches):
         start = batch_id * batch_size
         end = start + batch_size
         batch_inputs = inputs[start:end]
         batch_tries = tries[start:end]
         batch_rewards = rewards[start:end]
-        # On normalise les rewards
-        batch_rewards = (batch_rewards - batch_rewards.mean()) / (batch_rewards.std() + 1e-8)
 
+        # Log intermédiaire toutes les 10 itérations
+        if batch_id % 10 == 0:
+            logger.info(f"🔎 Batch {batch_id+1}: Reward mean={batch_rewards.mean().item():.4f}, std={batch_rewards.std().item():.4f}")
+
+        # Forward pass
         action_logits = auto_pilot(batch_inputs)
-        action_probabilities = torch.sigmoid(action_logits)
-        log_probabilities = get_action_log_probability(batch_tries,action_probabilities)
+        log_probabilities = get_action_log_probability(batch_tries, action_logits)
         loss = -(batch_rewards.view(-1, 1) * log_probabilities).mean()
+
+        # Backprop
         optimizer.zero_grad()
         loss.backward()
-        # on évite que ça explose
         torch.nn.utils.clip_grad_norm_(auto_pilot.parameters(), max_norm=1.0)
         optimizer.step()
-        # Log toutes les 50 itérations
+
+        # Log plus détaillé toutes les 10 itérations
         if batch_id % 10 == 0:
-            avg_reward = batch_rewards.mean().item()
-            logger.info(f"📉 Batch {batch_id+1}/{num_batches} | Loss={loss.item():.5f} | AvgReward={avg_reward:.3f}")
+            with torch.no_grad():
+                avg_reward = batch_rewards.mean().item()
+                avg_abs_reward = batch_rewards.abs().mean().item()
+                avg_logprob = log_probabilities.mean().item()
+                avg_grad = sum(
+                    (p.grad.abs().mean().item() if p.grad is not None else 0)
+                    for p in auto_pilot.parameters()
+                ) / (len(list(auto_pilot.parameters())) or 1)
 
+            logger.info(
+                f"📊 Batch {batch_id+1}/{num_batches} | "
+                f"Loss={loss.item():.6f} | "
+                f"Reward(mean/abs)={avg_reward:.3f}/{avg_abs_reward:.3f} | "
+                f"LogProb={avg_logprob:.3f} | Grad={avg_grad:.6f}"
+            )
 
-        # Sauvegarde périodique du modèle
+        # Sauvegarde périodique
         if save_every > 0 and (batch_id + 1) % save_every == 0:
             save_model(auto_pilot)
-    logger.info("🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️")
+
+    logger.info("🖥️" * 30)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
-    logger.info(f"✅ Entraînement terminé — modèle final sauvegardé avec timestamp {timestamp}.")
+    logger.info(f"✅ Entraînement terminé — modèle final sauvegardé ({timestamp}).")
+
 
 def load_simulation_from_file(path: str) -> list[HistoryPoint]:
     """
@@ -369,7 +435,7 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("✅ WebSocket connection established")
-    prediction_seconds_before_learning = 120
+    prediction_seconds_before_learning = 60
     fps = 30
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     predictions_count: int = 0
