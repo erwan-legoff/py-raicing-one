@@ -140,30 +140,36 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
 
         prev_pos = previous.result.get("positions", {}).get("car", {})
         curr_pos = current.world.get("positions", {}).get("car", {})
-        curr_speed = -float(current.world.get("speeds", {}).get("z", 0.0))
+        left_sensor = current.world.get("sensors",{}).get("left45Ray",  0)
+        right_sensor = current.world.get("sensors",{}).get("left45Ray",  0)
+        curr_z_speed = -float(current.world.get("speeds", {}).get("z", 0.0))
+        curr_x_speed = -float(current.world.get("speeds", {}).get("x", 0.0))
         road_pos = current.world.get("positions", {}).get("road", {})
         
         
         # Vérifie que les positions sont valides
         if not curr_pos or not prev_pos:
-            return 0.0
+            return 0.0 
 
         # Punition si la voiture est tombée sous la route
         if curr_pos.get("y", 0) < road_pos.get("y", 0):
-            return -100.0
+            return -10 * abs(curr_x_speed)
+    
+        
+        if(left_sensor < 0.1):
+            return curr_x_speed*5
+        if(right_sensor < 0.1):
+            return -curr_x_speed*5
 
         # Avancement positif sur Z (plus on va loin, mieux c’est)
         prev_z = prev_pos.get("z", 0.0)
         curr_z = curr_pos.get("z", 0.0)
-        logger.info(f"curr_z: {curr_z:.3f}")
         # Reward = distance parcourue vers l’avant * facteur de gain
-        if(curr_speed < 0.2 and curr_speed >= -1):
+        if(curr_z_speed < 0.2 and curr_z_speed >= -1):
             return -10
-        if(curr_speed < 0):
-            return 10 * curr_speed
-        reward = curr_speed - curr_z
-        
-        
+        if(curr_z_speed < 0):
+            return 10 * curr_z_speed
+        reward = curr_z_speed - curr_z
         return reward
 import math
 import torch.optim as optim
@@ -174,7 +180,33 @@ def get_action_log_probability(actions, probabilities):
     log_probs = torch.log(clipped_probs) * actions 
     return log_probs.sum(dim=1)
 
-def train(save_every=1000, resume: bool = False):
+
+SENSOR_MIN = 0.0
+SENSOR_MAX = 50.0
+SPEED_MAX = 10.0        
+ACCEL_MAX = 2.0
+
+def normalize_inputs(values: list[float]) -> torch.Tensor:
+    # 7 capteurs + 3 vitesses + 3 accélérations = 13 features
+    sensors = torch.tensor(values[:7])
+    speeds = torch.tensor(values[7:10])
+    accels = torch.tensor(values[10:13])
+
+    # Capteurs déjà positifs
+    sensors = (sensors - SENSOR_MIN) / (SENSOR_MAX - SENSOR_MIN + 1e-8)
+    
+    # Vitesse et accel : map [-max, +max] → [0, 1]
+    speeds = (speeds + SPEED_MAX) / (2 * SPEED_MAX + 1e-8)
+    accels = (accels + ACCEL_MAX) / (2 * ACCEL_MAX + 1e-8)
+
+    # Fusionne tout
+    normalized = torch.cat([sensors, speeds, accels])
+
+    # Clamp par sécurité
+    return torch.clamp(normalized, 0.0, 1.0)
+
+
+def train(batch_size= 64, save_every=1000, resume: bool = True):
     
     if resume:
         loaded = load_latest_model(auto_pilot)
@@ -182,28 +214,41 @@ def train(save_every=1000, resume: bool = False):
             logger.info("🔄 Modèle existant chargé, reprise de l'entraînement.")
         else:
             logger.info("🆕 Aucun modèle trouvé — entraînement à partir de zéro.")
+    inputs = torch.tensor([h.input for h in simulation_history], dtype=torch.float32, device=device)
+    tries = torch.tensor([h.output for h in simulation_history], dtype=torch.float32, device=device)
+    rewards = torch.tensor([h.reward for h in simulation_history], dtype=torch.float32, device=device)
+    num_batches = math.ceil(len(inputs) / batch_size)
+    logger.info(f"🧮 Début entraînement sur {len(inputs)} transitions ({num_batches} batchs)")
+    logger.info("🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️")
     auto_pilot.train()
-    for i, history_point in enumerate(simulation_history):
-        driving_experiment = torch.tensor([history_point.input], dtype=torch.float32, device=device)
-        driving_try = torch.tensor([history_point.output], dtype=torch.float32, device=device)
-        action_logits = auto_pilot(driving_experiment )
+    for batch_id in range(num_batches):
+        start = batch_id * batch_size
+        end = start + batch_size
+        batch_inputs = inputs[start:end]
+        batch_tries = tries[start:end]
+        batch_rewards = rewards[start:end]
+        # On normalise les rewards
+        batch_rewards = (batch_rewards - batch_rewards.mean()) / (batch_rewards.std() + 1e-8)
+
+        action_logits = auto_pilot(batch_inputs)
         action_probabilities = torch.sigmoid(action_logits)
-        log_probabilities = get_action_log_probability(driving_try,action_probabilities)
-        loss = -float(history_point.reward)* log_probabilities.mean()
+        log_probabilities = get_action_log_probability(batch_tries,action_probabilities)
+        loss = -(batch_rewards.view(-1, 1) * log_probabilities).mean()
         optimizer.zero_grad()
         loss.backward()
         # on évite que ça explose
         torch.nn.utils.clip_grad_norm_(auto_pilot.parameters(), max_norm=1.0)
         optimizer.step()
         # Log toutes les 50 itérations
-        if i % 50 == 0:
-            logger.info(f"📉 Step {i}/{len(simulation_history)} | Loss={loss.item():.5f} | Reward={float(history_point.reward):.3f}")
+        if batch_id % 10 == 0:
+            avg_reward = batch_rewards.mean().item()
+            logger.info(f"📉 Batch {batch_id+1}/{num_batches} | Loss={loss.item():.5f} | AvgReward={avg_reward:.3f}")
 
 
         # Sauvegarde périodique du modèle
-        if save_every > 0 and (i + 1) % save_every == 0:
+        if save_every > 0 and (batch_id + 1) % save_every == 0:
             save_model(auto_pilot)
-    
+    logger.info("🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️🖥️")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
     logger.info(f"✅ Entraînement terminé — modèle final sauvegardé avec timestamp {timestamp}.")
@@ -318,7 +363,7 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 
     path = os.path.join(directory, filename)
     torch.save(model.state_dict(), path)
-    logger.info(f"💾 Modèle sauvegardé dans {path}")
+    # logger.info(f"💾 Modèle sauvegardé dans {path}")
 
 @app.websocket("/ai")
 async def websocket_endpoint(ws: WebSocket):
@@ -338,7 +383,7 @@ async def websocket_endpoint(ws: WebSocket):
             predictions_count = predictions_count + 1  
             # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
             
-            new_history_point, chosen = predict_actions(payload)
+            new_history_point, chosen = predict_actions(payload, predictions_count)
             if(predictions_count >= predictions_before_learning):
                 predictions_count = 0
                 train()
@@ -351,11 +396,15 @@ async def websocket_endpoint(ws: WebSocket):
         save_simulation_history(simulation_history)
         logger.warning(f"⚠️ WebSocket closed: {e}")
 
-def predict_actions(payload):
+def predict_actions(payload, i = 0):
+    # i contient l'indice (ou compteur) de la frame actuelle depuis la boucle websocket
+    frame_idx = int(i)
     if(len(simulation_history) > 0):
         simulation_history[-1].result = payload
         reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
-        logger.info(f"👌Reward: {reward:.2f}👌")
+        # Log reward seulement toutes les 10 frames pour réduire le bruit
+        if frame_idx % 10 == 0:
+            logger.info(f"👌Reward: {reward:.2f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
     new_history_point.world = payload
@@ -372,8 +421,8 @@ def predict_actions(payload):
 
             # 3️⃣ Fusion complète : [7 capteurs] + [3 vitesses] + [3 accels] = 13 features
     values = sensor_values + speed_values + accel_values
-
-    data_input = torch.tensor([values], dtype=torch.float32, device=device)
+    normalized_input = normalize_inputs(values).unsqueeze(0).to(device)
+    data_input = normalized_input
 
     with torch.no_grad():
         logits = auto_pilot(data_input)
@@ -381,12 +430,26 @@ def predict_actions(payload):
         active = (probs>=torch.rand_like(probs)).int()[0].tolist()
         chosen = [driving_inputs[i] for i, v in enumerate(active) if v == 1]
 
-    logger.info(f"Inputs: {[round(v, 2) for v in values]}")
-
+    # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
+    if frame_idx % 10 == 0:
+        # Affiche la position Z de la voiture (curr_z) — déplacé depuis compute_reward
+        try:
+            curr_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
+        except Exception:
+            curr_z = 0.0
+        try:
+            curr_x_speed = float(payload.get("speeds", {}).get("x", 0.0))
+        except Exception:
+            curr_x_speed = 0.0
+        logger.info(f"curr_z: {curr_z:.3f} | curr_x_speed: {curr_x_speed:.3f}")
+        logger.info(f"Inputs: {[round(v, 2) for v in values]}")
+        # log normalized inputs
+        logger.info(f"Normalized: {[round(v.item(), 2) for v in normalized_input[0]]}")
             
     new_history_point.input = values
     new_history_point.output = active
-    logger.info(f"Actions: {chosen}")
+    if frame_idx % 10 == 0:
+        logger.info(f"Actions: {chosen}")
     return new_history_point,chosen
 
     
