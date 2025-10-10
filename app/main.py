@@ -89,7 +89,7 @@ class HistoryPoint:
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
 auto_pilot.to(device)
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
-simulation_history = []
+simulation_history: list[HistoryPoint] = []
 import json
 from datetime import datetime
 SAVE_INTERVAL = 60
@@ -140,7 +140,7 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
 
         prev_pos = previous.result.get("positions", {}).get("car", {})
         curr_pos = current.world.get("positions", {}).get("car", {})
-        curr_speed = -current.world.get("speeds", {}).get("z", {})
+        curr_speed = -float(current.world.get("speeds", {}).get("z", 0.0))
         road_pos = current.world.get("positions", {}).get("road", {})
         
         
@@ -158,7 +158,7 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         logger.info(f"prev_z: {prev_z:.3f}")
         logger.info(f"curr_z: {curr_z:.3f}")
         # Reward = distance parcourue vers l’avant * facteur de gain
-        if(curr_speed < 0.2 and curr_speed >= 0):
+        if(curr_speed < 0.2 and curr_speed >= -1):
             return -10
         if(curr_speed < 0):
             return 10 * curr_speed
@@ -166,59 +166,228 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         
         logger.info(f"Reward: {reward:.3f}")
         return reward
+import math
+import torch.optim as optim
+optimizer = optim.Adam(auto_pilot.parameters(), lr=1e-4)
+def get_action_log_probability(actions, probabilities):
+    eps = 1e-8
+    clipped_probs = torch.clamp(probabilities, eps, 1 - eps)
+    log_probs = torch.log(clipped_probs) * actions 
+    return log_probs.sum(dim=1)
+
+def train(save_every=100, resume: bool = False):
+    
+    if resume:
+        loaded = load_latest_model(auto_pilot)
+        if loaded:
+            logger.info("🔄 Modèle existant chargé, reprise de l'entraînement.")
+        else:
+            logger.info("🆕 Aucun modèle trouvé — entraînement à partir de zéro.")
+    auto_pilot.train()
+    for i, history_point in enumerate(simulation_history):
+        driving_experiment = torch.tensor([history_point.input], dtype=torch.float32, device=device)
+        driving_try = torch.tensor([history_point.output], dtype=torch.float32, device=device)
+        action_logits = auto_pilot(driving_experiment )
+        action_probabilities = torch.sigmoid(action_logits)
+        log_probabilities = get_action_log_probability(driving_try,action_probabilities)
+        loss = -float(history_point.reward)* log_probabilities.mean()
+        optimizer.zero_grad()
+        loss.backward()
+        # on évite que ça explose
+        torch.nn.utils.clip_grad_norm_(auto_pilot.parameters(), max_norm=1.0)
+        optimizer.step()
+        # Log toutes les 50 itérations
+        if i % 50 == 0:
+            logger.info(f"📉 Step {i}/{len(simulation_history)} | Loss={loss.item():.5f} | Reward={float(history_point.reward):.3f}")
 
 
-import random
+        # Sauvegarde périodique du modèle
+        if save_every > 0 and (i + 1) % save_every == 0:
+            save_model(auto_pilot)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
+    logger.info(f"✅ Entraînement terminé — modèle final sauvegardé avec timestamp {timestamp}.")
+
+def load_simulation_from_file(path: str) -> list[HistoryPoint]:
+    """
+    Charge une simulation sauvegardée depuis un fichier JSON.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        history_points = []
+        for item in data:
+            hp = HistoryPoint(
+                input=item.get("input", []),
+                output=item.get("output", []),
+                world=item.get("world", {}),
+                result=item.get("result", {}),
+                reward=item.get("reward", 0.0)
+            )
+            history_points.append(hp)
+        logger.info(f"📂 Fichier chargé : {path} ({len(history_points)} transitions)")
+        return history_points
+    except Exception as e:
+        logger.error(f"❌ Erreur de lecture du fichier {path} : {e}")
+        return []
+
+def load_latest_model(model: nn.Module, directory: str = "models") -> bool:
+    """
+    Recharge automatiquement le dernier modèle sauvegardé (le plus récent)
+    depuis le dossier spécifié.
+
+    Args:
+        model (nn.Module): le modèle PyTorch à recharger
+        directory (str): dossier contenant les fichiers .pt
+
+    Returns:
+        bool: True si un modèle a été chargé, False sinon
+    """
+    if not os.path.exists(directory):
+        logger.warning(f"⚠️ Le dossier {directory} n'existe pas.")
+        return False
+
+    files = [f for f in os.listdir(directory) if f.endswith(".pt")]
+    if not files:
+        logger.warning(f"⚠️ Aucun fichier .pt trouvé dans {directory}.")
+        return False
+
+    # Trie par date de modification
+    files.sort(key=lambda f: os.path.getmtime(os.path.join(directory, f)), reverse=True)
+    latest_file = files[0]
+    latest_path = os.path.join(directory, latest_file)
+
+    try:
+        model.load_state_dict(torch.load(latest_path, map_location=device))
+        model.to(device)
+        logger.info(f"📂 Modèle rechargé : {latest_file} sur {device}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Échec du chargement de {latest_file} : {e}")
+        return False
+
+def train_from_file(directory: str = "sessions"):
+    """
+    Itère sur tous les fichiers d'entraînement (simulation_*.json)
+    et entraîne le modèle sur chaque simulation.
+    """
+    if not os.path.exists(directory):
+        logger.warning(f"⚠️ Dossier {directory} inexistant.")
+        return
+
+    files = [f for f in os.listdir(directory) if f.endswith(".json")]
+    if not files:
+        logger.warning(f"⚠️ Aucun fichier de simulation trouvé dans {directory}")
+        return
+
+    logger.info(f"🔍 {len(files)} fichiers trouvés dans {directory}.")
+    total_transitions = 0
+
+    for file in sorted(files):
+        path = os.path.join(directory, file)
+        simulation_data = load_simulation_from_file(path)
+        if not simulation_data:
+            continue
+
+        # remplace temporairement la simulation active
+        global simulation_history
+        simulation_history = simulation_data
+
+        train()
+        total_transitions += len(simulation_data)
+
+    logger.info(f"✅ Entraînement terminé sur {len(files)} fichiers ({total_transitions} transitions)")
+    # sauvegarde du modèle
+    torch.save(auto_pilot.state_dict(), "autopilot_trained.pt")
+    logger.info("💾 Modèle sauvegardé : autopilot_trained.pt")
+
+def save_model(model: nn.Module, directory: str = "models", filename: str | None = None):
+    """
+    Sauvegarde le modèle PyTorch dans le dossier spécifié.
+
+    Args:
+        model (nn.Module): le modèle à sauvegarder
+        directory (str): dossier de sortie
+        filename (str | None): nom de fichier (sinon horodaté)
+    """
+    os.makedirs(directory, exist_ok=True)
+
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"autopilot_{timestamp}.pt"
+
+    path = os.path.join(directory, filename)
+    torch.save(model.state_dict(), path)
+    logger.info(f"💾 Modèle sauvegardé dans {path}")
 
 @app.websocket("/ai")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("✅ WebSocket connection established")
-
+    prediction_seconds_before_learning = 60
+    fps = 60
+    predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
+    predictions_count: int = 0
     try:
         while True:
+            if(predictions_count == 0):
+                await ws.send_json({"driving_inputs": ["RESET"]})
+                logger.info("🔁 Envoi d’un reset à la simulation")
             payload = await ws.receive_json()
+    
+            predictions_count = predictions_count + 1  
             # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
-            if(len(simulation_history) > 0):
-                simulation_history[-1].result = payload
-                reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
-                simulation_history[-1].reward = reward
-            new_history_point = HistoryPoint()
-            new_history_point.world = payload
-            sensors = payload.get("sensors", {})
-            speeds = payload.get("speeds", {})
-            accels = payload.get("accelerations", {})
-
-            # 1️⃣ Distances dans l’ordre défini
-            sensor_values = [sensors.get(k, 0.0) for k in sensor_order]
-
-            # 2️⃣ Vitesses et accélérations (x, y, z)
-            speed_values = [speeds.get(axis, 0.0) for axis in ("x", "y", "z")]
-            accel_values = [accels.get(axis, 0.0) for axis in ("x", "y", "z")]
-
-            # 3️⃣ Fusion complète : [7 capteurs] + [3 vitesses] + [3 accels] = 13 features
-            values = sensor_values + speed_values + accel_values
-
-            data_input = torch.tensor([values], dtype=torch.float32, device=device)
-
-            with torch.no_grad():
-                logits = auto_pilot(data_input)
-                probs = torch.sigmoid(logits)
-                active = (probs>=torch.rand_like(probs)).int()[0].tolist()
-                chosen = [driving_inputs[i] for i, v in enumerate(active) if v == 1]
-
-            logger.info(f"Inputs: {[round(v, 2) for v in values]}")
-
             
-            new_history_point.input = values
-            new_history_point.output = chosen
-            logger.info(f"Actions: {chosen}")
+            new_history_point, chosen = predict_actions(payload)
+            if(predictions_count >= predictions_before_learning):
+                predictions_count = 0
+                train()
+                save_simulation_history(simulation_history)
+                simulation_history.clear()
 
             await ws.send_json({"driving_inputs": chosen})
             simulation_history.append(new_history_point)
     except Exception as e:
         save_simulation_history(simulation_history)
         logger.warning(f"⚠️ WebSocket closed: {e}")
+
+def predict_actions(payload):
+    if(len(simulation_history) > 0):
+        simulation_history[-1].result = payload
+        reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
+        simulation_history[-1].reward = reward
+    new_history_point = HistoryPoint()
+    new_history_point.world = payload
+    sensors = payload.get("sensors", {})
+    speeds = payload.get("speeds", {})
+    accels = payload.get("accelerations", {})
+
+            # 1️⃣ Distances dans l’ordre défini
+    sensor_values = [sensors.get(k, 0.0) for k in sensor_order]
+
+            # 2️⃣ Vitesses et accélérations (x, y, z)
+    speed_values = [speeds.get(axis, 0.0) for axis in ("x", "y", "z")]
+    accel_values = [accels.get(axis, 0.0) for axis in ("x", "y", "z")]
+
+            # 3️⃣ Fusion complète : [7 capteurs] + [3 vitesses] + [3 accels] = 13 features
+    values = sensor_values + speed_values + accel_values
+
+    data_input = torch.tensor([values], dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        logits = auto_pilot(data_input)
+        probs = torch.sigmoid(logits)
+        active = (probs>=torch.rand_like(probs)).int()[0].tolist()
+        chosen = [driving_inputs[i] for i, v in enumerate(active) if v == 1]
+
+    logger.info(f"Inputs: {[round(v, 2) for v in values]}")
+
+            
+    new_history_point.input = values
+    new_history_point.output = active
+    logger.info(f"Actions: {chosen}")
+    return new_history_point,chosen
 
     
 
