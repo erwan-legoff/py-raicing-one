@@ -92,7 +92,7 @@ driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 simulation_history: list[HistoryPoint] = []
 import json
 from datetime import datetime
-SAVE_INTERVAL = 60
+SAVE_INTERVAL = 120
 def save_simulation_history(simulation_history, directory="sessions"):
     """
     Sauvegarde la simulation actuelle dans un fichier JSON horodaté.
@@ -155,16 +155,15 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         # Avancement positif sur Z (plus on va loin, mieux c’est)
         prev_z = prev_pos.get("z", 0.0)
         curr_z = curr_pos.get("z", 0.0)
-        logger.info(f"prev_z: {prev_z:.3f}")
         logger.info(f"curr_z: {curr_z:.3f}")
         # Reward = distance parcourue vers l’avant * facteur de gain
         if(curr_speed < 0.2 and curr_speed >= -1):
             return -10
         if(curr_speed < 0):
             return 10 * curr_speed
-        reward = curr_speed
+        reward = curr_speed - curr_z
         
-        logger.info(f"Reward: {reward:.3f}")
+        
         return reward
 import math
 import torch.optim as optim
@@ -175,7 +174,7 @@ def get_action_log_probability(actions, probabilities):
     log_probs = torch.log(clipped_probs) * actions 
     return log_probs.sum(dim=1)
 
-def train(save_every=100, resume: bool = False):
+def train(save_every=1000, resume: bool = False):
     
     if resume:
         loaded = load_latest_model(auto_pilot)
@@ -325,7 +324,7 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("✅ WebSocket connection established")
-    prediction_seconds_before_learning = 60
+    prediction_seconds_before_learning = 15
     fps = 60
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     predictions_count: int = 0
@@ -356,6 +355,7 @@ def predict_actions(payload):
     if(len(simulation_history) > 0):
         simulation_history[-1].result = payload
         reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
+        logger.info(f"👌Reward: {reward:.2f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
     new_history_point.world = payload
