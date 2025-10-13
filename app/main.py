@@ -92,8 +92,8 @@ from dataclasses import dataclass, field
 class HistoryPoint:
     input: list = field(default_factory=list)
     output: list = field(default_factory=list)
-    world: dict = field(default_factory=dict)
-    result: dict = field(default_factory=dict)
+    world_input: dict = field(default_factory=dict)
+    world_result: dict = field(default_factory=dict)
     reward: float = 0.0
 
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
@@ -141,36 +141,40 @@ def periodic_auto_save(simulation_history):
 if __name__ == "__main__":
     periodic_auto_save(simulation_history)
 
-def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
+def compute_reward(historyPoint: HistoryPoint) -> float:
         """
         Calcule la récompense (reward) entre deux états successifs de simulation.
         - Pénalise fort si la voiture tombe sous la route
         - Récompense le déplacement vers l'avant (axe Z)
         """
 
-        curr_pos = previous.result.get("positions", {}).get("car", {})
-        prev_pos = current.world.get("positions", {}).get("car", {})
-        left_sensor = current.world.get("sensors",{}).get("left45Ray",  0)
-        right_sensor = current.world.get("sensors", {}).get("right45Ray", 0)
-        curr_z_speed = -float(current.result.get("speeds", {}).get("z", 0.0))
-        curr_y_speed = -float(current.result.get("speeds", {}).get("y", 0.0))
-        curr_x_speed = -float(current.result.get("speeds", {}).get("x", 0.0))
-        road_pos = current.world.get("positions", {}).get("road", {})
+        world_result = historyPoint.world_result
+        world_input = historyPoint.world_input
+        
+        position_result = world_result.get("positions", {}).get("car", {})
+        position_input = world_input.get("positions", {}).get("car", {})
+
+        left_sensor = world_result.get("sensors",{}).get("left45Ray",  0)
+        right_sensor = world_result.get("sensors", {}).get("right45Ray", 0)
+        curr_z_speed = -float(world_result.get("speeds", {}).get("z", 0.0))
+        curr_y_speed = float(world_result.get("speeds", {}).get("y", 0.0))
+        curr_x_speed = float(world_result.get("speeds", {}).get("x", 0.0))
+        road_pos = world_input.get("positions", {}).get("road", {})
         # Avancement positif sur Z (plus on va loin, mieux c’est)
-        prev_z = prev_pos.get("z", 0.0)
-        curr_z = curr_pos.get("z", 0.0)
-        curr_y = curr_pos.get("y", 0.0)
+        prev_z = -position_input.get("z", 0.0)
+        curr_z = -position_result.get("z", 0.0)
+        curr_y = position_result.get("y", 0.0)
         
         # Vérifie que les positions sont valides
-        if not curr_pos or not prev_pos:
+        if not position_result or not position_input:
             return 0.0 
 
         # Punition si la voiture est tombée sous la route
-        if curr_pos.get("y", 0) < road_pos.get("y", 0):
+        if position_result.get("y", 0) < road_pos.get("y", 0):
             return -10 * abs(curr_x_speed)
 
         # punition si la voiture était à un previous z inférieur à -5 mais que la current est supérieur à -1
-        if(prev_z < -5 and curr_z > -1):
+        if(prev_z > 5 and curr_z < 1):
             return -100
 
         
@@ -185,7 +189,7 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
             return -10
         if(curr_z_speed < 0):
             return 10 * curr_z_speed
-        reward = -curr_z_speed * curr_z
+        reward = curr_z_speed * curr_z
         return reward
 import math
 import torch.optim as optim
@@ -348,8 +352,8 @@ def load_simulation_from_file(path: str) -> list[HistoryPoint]:
             hp = HistoryPoint(
                 input=item.get("input", []),
                 output=item.get("output", []),
-                world=item.get("world", {}),
-                result=item.get("result", {}),
+                world_input=item.get("world", {}),
+                world_result=item.get("result", {}),
                 reward=item.get("reward", 0.0)
             )
             history_points.append(hp)
@@ -483,8 +487,9 @@ def predict_actions(payload, i = 0):
     # i contient l'indice (ou compteur) de la frame actuelle depuis la boucle websocket
     frame_idx = int(i)
     if(len(simulation_history) > 0):
-        simulation_history[-1].result = payload
-        reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
+        # Ceci est le résultat de la prédiction précédente
+        simulation_history[-1].world_result = payload
+        reward = compute_reward(simulation_history[-1])
         # Log reward seulement toutes les 10 frames pour réduire le bruit
         if frame_idx % 3 == 0:
             logger.info(f"Trained Count: {auto_pilot.training_count:.2f}👌")
@@ -492,7 +497,7 @@ def predict_actions(payload, i = 0):
             logger.info(f"👌Reward: {reward:.0f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
-    new_history_point.world = payload
+    new_history_point.world_input = payload
     sensors = payload.get("sensors", {})
     speeds = payload.get("speeds", {})
     accels = payload.get("accelerations", {})
