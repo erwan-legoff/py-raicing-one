@@ -53,6 +53,16 @@ class AutoPilot(nn.Module):
         self.hidden_layer_2 = nn.Linear(hidden_size,hidden_size//2, device=device)
         self.non_linear_3 = nn.ReLU()
         self.output_layer = nn.Linear(hidden_size//2,output_size, device=device)
+        self.training_count = 0  # Compteur d'itérations d'entraînement
+
+    def state_dict(self, *args, **kwargs):
+        state = super().state_dict(*args, **kwargs)
+        state["_training_count"] = self.training_count
+        return state
+    
+    def load_state_dict(self, state_dict, strict=True):
+        self.training_count = state_dict.pop("_training_count", 0)
+        super().load_state_dict(state_dict, strict)
 
     def forward(self, inputs):
         inputs = self.input_layer(inputs)
@@ -138,13 +148,13 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         - Récompense le déplacement vers l'avant (axe Z)
         """
 
-        prev_pos = previous.result.get("positions", {}).get("car", {})
-        curr_pos = current.world.get("positions", {}).get("car", {})
+        curr_pos = previous.result.get("positions", {}).get("car", {})
+        prev_pos = current.world.get("positions", {}).get("car", {})
         left_sensor = current.world.get("sensors",{}).get("left45Ray",  0)
         right_sensor = current.world.get("sensors", {}).get("right45Ray", 0)
-        curr_z_speed = -float(current.world.get("speeds", {}).get("z", 0.0))
-        curr_y_speed = -float(current.world.get("speeds", {}).get("y", 0.0))
-        curr_x_speed = -float(current.world.get("speeds", {}).get("x", 0.0))
+        curr_z_speed = -float(current.result.get("speeds", {}).get("z", 0.0))
+        curr_y_speed = -float(current.result.get("speeds", {}).get("y", 0.0))
+        curr_x_speed = -float(current.result.get("speeds", {}).get("x", 0.0))
         road_pos = current.world.get("positions", {}).get("road", {})
         # Avancement positif sur Z (plus on va loin, mieux c’est)
         prev_z = prev_pos.get("z", 0.0)
@@ -158,16 +168,20 @@ def compute_reward(previous: HistoryPoint, current: HistoryPoint) -> float:
         # Punition si la voiture est tombée sous la route
         if curr_pos.get("y", 0) < road_pos.get("y", 0):
             return -10 * abs(curr_x_speed)
-    
+
+        # punition si la voiture était à un previous z inférieur à -5 mais que la current est supérieur à -1
+        if(prev_z < -5 and curr_z > -1):
+            return -100
+
         
-        if(left_sensor < 0.1):
+        if(left_sensor < 1):
             return curr_x_speed*5
-        if(right_sensor < 0.1):
+        if(right_sensor < 1):
             return -curr_x_speed*5
 
         
         # Reward = distance parcourue vers l’avant * facteur de gain
-        if(curr_z_speed < 0.2 and curr_z_speed >= -1 and curr_y < 0.1 and curr_y_speed >= 0):
+        if(curr_z_speed < 0.2 and curr_z_speed >= -1):
             return -10
         if(curr_z_speed < 0):
             return 10 * curr_z_speed
@@ -252,7 +266,8 @@ def process_rewards(simulation_history: list[HistoryPoint]) -> torch.Tensor:
 
 
 
-def train(batch_size=64, save_every=1000, resume: bool = True):
+def train(batch_size=16, save_every=1000, resume: bool = False):
+
     if resume:
         loaded = load_latest_model(auto_pilot)
         if loaded:
@@ -277,7 +292,7 @@ def train(batch_size=64, save_every=1000, resume: bool = True):
         batch_rewards = rewards[start:end]
 
         # Log intermédiaire toutes les 10 itérations
-        if batch_id % 10 == 0:
+        if batch_id % 3 == 0:
             logger.info(f"🔎 Batch {batch_id+1}: Reward mean={batch_rewards.mean().item():.4f}, std={batch_rewards.std().item():.4f}")
 
         # Forward pass
@@ -292,7 +307,7 @@ def train(batch_size=64, save_every=1000, resume: bool = True):
         optimizer.step()
 
         # Log plus détaillé toutes les 10 itérations
-        if batch_id % 10 == 0:
+        if batch_id % 3 == 0:
             with torch.no_grad():
                 avg_reward = batch_rewards.mean().item()
                 avg_abs_reward = batch_rewards.abs().mean().item()
@@ -312,8 +327,10 @@ def train(batch_size=64, save_every=1000, resume: bool = True):
         # Sauvegarde périodique
         if save_every > 0 and (batch_id + 1) % save_every == 0:
             save_model(auto_pilot)
-
+    auto_pilot.training_count += 1
+    logger.info(f"🚀 Entraînement n°{auto_pilot.training_count} fini")
     logger.info("🖥️" * 30)
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
     logger.info(f"✅ Entraînement terminé — modèle final sauvegardé ({timestamp}).")
@@ -436,7 +453,7 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("✅ WebSocket connection established")
     prediction_seconds_before_learning = 60
-    fps = 30
+    fps = 4
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     predictions_count: int = 0
     try:
@@ -461,7 +478,7 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         save_simulation_history(simulation_history)
         logger.warning(f"⚠️ WebSocket closed: {e}")
-
+IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
 def predict_actions(payload, i = 0):
     # i contient l'indice (ou compteur) de la frame actuelle depuis la boucle websocket
     frame_idx = int(i)
@@ -469,9 +486,10 @@ def predict_actions(payload, i = 0):
         simulation_history[-1].result = payload
         reward = compute_reward(simulation_history[-1], HistoryPoint(world=payload))
         # Log reward seulement toutes les 10 frames pour réduire le bruit
-        if frame_idx % 10 == 0:
+        if frame_idx % 3 == 0:
+            logger.info(f"Trained Count: {auto_pilot.training_count:.2f}👌")
             logger.info(f"Frame {frame_idx}")
-            logger.info(f"👌Reward: {reward:.2f}👌")
+            logger.info(f"👌Reward: {reward:.0f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
     new_history_point.world = payload
@@ -493,31 +511,87 @@ def predict_actions(payload, i = 0):
 
     with torch.no_grad():
         logits = auto_pilot(data_input)
-        probs = torch.sigmoid(logits)
-        active = (probs>=torch.rand_like(probs)).int()[0].tolist()
-        chosen = [driving_inputs[i] for i, v in enumerate(active) if v == 1]
+
+        chosen = choose_actions_tensor(logits, threshold=0.4, device=device)
+
 
     # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
-    if frame_idx % 10 == 0:
+    if frame_idx % 3 == 0:
         # Affiche la position Z de la voiture (curr_z) — déplacé depuis compute_reward
-        try:
-            curr_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
-        except Exception:
-            curr_z = 0.0
-        try:
-            curr_x_speed = float(payload.get("speeds", {}).get("x", 0.0))
-        except Exception:
-            curr_x_speed = 0.0
+        
+        curr_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
+        curr_x_speed = float(payload.get("speeds", {}).get("x", 0.0))
+            
         logger.info(f"curr_z: {curr_z:.3f} | curr_x_speed: {curr_x_speed:.3f}")
         logger.info(f"Inputs: {[round(v, 2) for v in values]}")
         # log normalized inputs
         logger.info(f"Normalized: {[round(v.item(), 2) for v in normalized_input[0]]}")
             
     new_history_point.input = values
-    new_history_point.output = active
-    if frame_idx % 10 == 0:
+    new_history_point.output = chosen 
+    if frame_idx % 3 == 0:
         logger.info(f"Actions: {chosen}")
     return new_history_point,chosen
+
+# Indices: 0=LEFT, 1=FORWARD, 2=RIGHT, 3=BACKWARD
+IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
+
+def choose_actions_tensor(logits: torch.Tensor,
+                          threshold: float = 0.4,
+                          device: torch.device = torch.device("cpu")) -> list[str]:
+    """
+    Pipeline propre:
+    - probs = sigmoid(logits)
+    - masque threshold > 0.4
+    - FORWARD domine BACKWARD
+    - LEFT vs RIGHT: garder le plus probable
+    - sampling Bernoulli sur probs masquées
+    - fallback si rien choisi: argmax(prob)
+    Retour: liste des noms d'actions activées
+    """
+    # logits shape attendu: [1, 4] ou [4]
+    if logits.dim() == 2:
+        probs = torch.sigmoid(logits)[0]  # [4]
+    else:
+        probs = torch.sigmoid(logits)     # [4]
+    probs = probs.to(device)
+
+    # 1) threshold
+    mask = probs > threshold  # torch.bool, [4]
+
+    # FORWARD prioritaire
+    if mask[IDX_FORWARD] and mask[IDX_BACKWARD]:
+        mask[IDX_BACKWARD] = False
+
+    # 3) LEFT vs RIGHT: garder le plus probable si les deux passent
+    if mask[IDX_LEFT] and mask[IDX_RIGHT]:
+        if probs[IDX_LEFT] >= probs[IDX_RIGHT]:
+            mask[IDX_RIGHT] = False
+        else:
+            mask[IDX_LEFT] = False
+
+    # 4) Appliquer le masque aux probabilités
+    masked_probs = probs.clone()
+    masked_probs[~mask] = 0.0
+
+    # 5) Tirage stochastique Bernoulli indépendant
+    #    Attention: il faut un tensor random du même shape [4]
+    rnd = torch.rand_like(masked_probs)
+    active = (masked_probs >= rnd).int()  # [4], 0/1
+
+    # 6) Fallback: si toutes à 0, choisir l'argmax des probs d'origine
+    if active.sum().item() == 0:
+        best_idx = int(torch.argmax(probs).item())
+        # Respecter nos règles: si best=BACKWARD mais FORWARD passe le seuil, on préfère FORWARD
+        if best_idx == IDX_BACKWARD and (probs[IDX_FORWARD] > threshold):
+            best_idx = IDX_FORWARD
+        active[best_idx] = 1
+
+    # 7) Mapping indices -> noms en gardant l’ordre fixe 0..3
+    driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3: "BACKWARD"}
+    chosen = [driving_inputs[i] for i in range(4) if active[i].item() == 1]
+    return chosen
+
 
     
 
