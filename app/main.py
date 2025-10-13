@@ -154,42 +154,48 @@ def compute_reward(historyPoint: HistoryPoint) -> float:
         position_result = world_result.get("positions", {}).get("car", {})
         position_input = world_input.get("positions", {}).get("car", {})
 
-        left_sensor = world_result.get("sensors",{}).get("left45Ray",  0)
-        right_sensor = world_result.get("sensors", {}).get("right45Ray", 0)
-        curr_z_speed = -float(world_result.get("speeds", {}).get("z", 0.0))
+        result_left_sensor = world_result.get("sensors",{}).get("left45Ray",  0)
+        result_right_sensor = world_result.get("sensors", {}).get("right45Ray", 0)
+        # On inverse l’axe Z pour que avancer → reward positif
+        result_z_speed = -float(world_result.get("speeds", {}).get("z", 0.0))
         curr_y_speed = float(world_result.get("speeds", {}).get("y", 0.0))
-        curr_x_speed = float(world_result.get("speeds", {}).get("x", 0.0))
+        result_x_speed = float(world_result.get("speeds", {}).get("x", 0.0))
         road_pos = world_input.get("positions", {}).get("road", {})
         # Avancement positif sur Z (plus on va loin, mieux c’est)
-        prev_z = -position_input.get("z", 0.0)
-        curr_z = -position_result.get("z", 0.0)
-        curr_y = position_result.get("y", 0.0)
-        
+        input_position_z = -position_input.get("z", 0.0)
+        result_position_z = -position_result.get("z", 0.0)
+        result_position_y = position_result.get("y", 0.0)
+        reward = 0
         # Vérifie que les positions sont valides
         if not position_result or not position_input:
             return 0.0 
 
         # Punition si la voiture est tombée sous la route
-        if position_result.get("y", 0) < road_pos.get("y", 0):
-            return -10 * abs(curr_x_speed)
+        if result_position_y < road_pos.get("y", 0):
+            return -10 * abs(result_x_speed)
 
-        # punition si la voiture était à un previous z inférieur à -5 mais que la current est supérieur à -1
-        if(prev_z > 5 and curr_z < 1):
+        # Si la revient au début, c'est que la prédiction est mauvaise, on punit
+        if(input_position_z > 5 and result_position_z < 1):
             return -100
 
-        
-        if(left_sensor < 1):
-            return curr_x_speed*5
-        if(right_sensor < 1):
-            return -curr_x_speed*5
+        # Quand on s'approche d'un côté, on punit proportionnellement à la vitesse vers ce côté et à la proximité
+        # Pour aller à gauche, la vitesse doit être négative
+        # Donc si elle est positive on récompense par rapport à la vitesse et si elle est négative on punit
+        if(result_left_sensor < 2):
+            reward += result_x_speed*5*(2-result_left_sensor)
+        # Pour aller à droite, la vitesse doit être positive
+        # Donc si elle est négative on récompense par rapport à la vitesse et si elle est positive on punit
+        if(result_right_sensor < 2):
+            reward += -result_x_speed*5*(2-result_right_sensor)
 
         
-        # Reward = distance parcourue vers l’avant * facteur de gain
-        if(curr_z_speed < 0.2 and curr_z_speed >= -1):
-            return -10
-        if(curr_z_speed < 0):
-            return 10 * curr_z_speed
-        reward = curr_z_speed * curr_z
+        # Si on avance peu ou qu'on recule légèrement, on punit de 10
+        if(result_z_speed < 0.2 and result_z_speed >= -1):
+            reward += -10
+
+        # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
+        reward += result_z_speed * 10
+
         return reward
 import math
 import torch.optim as optim
@@ -521,7 +527,7 @@ def predict_actions(payload, i = 0):
 
 
     # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
-    if frame_idx % 3 == 0:
+    if frame_idx % 2 == 0:
         # Affiche la position Z de la voiture (curr_z) — déplacé depuis compute_reward
         
         curr_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
@@ -529,9 +535,7 @@ def predict_actions(payload, i = 0):
             
         logger.info(f"curr_z: {curr_z:.3f} | curr_x_speed: {curr_x_speed:.3f}")
         logger.info(f"Inputs: {[round(v, 2) for v in values]}")
-        # log normalized inputs
-        logger.info(f"Normalized: {[round(v.item(), 2) for v in normalized_input[0]]}")
-            
+        # log normalized inputs            
     new_history_point.input = values
     new_history_point.output = chosen 
     if frame_idx % 3 == 0:
@@ -584,17 +588,19 @@ def choose_actions_tensor(logits: torch.Tensor,
     rnd = torch.rand_like(masked_probs)
     active = (masked_probs >= rnd).int()  # [4], 0/1
 
-    # 6) Fallback: si toutes à 0, choisir l'argmax des probs d'origine
-    if active.sum().item() == 0:
-        best_idx = int(torch.argmax(probs).item())
-        # Respecter nos règles: si best=BACKWARD mais FORWARD passe le seuil, on préfère FORWARD
-        if best_idx == IDX_BACKWARD and (probs[IDX_FORWARD] > threshold):
-            best_idx = IDX_FORWARD
-        active[best_idx] = 1
+    # # 6) Fallback: si toutes à 0, choisir l'argmax des probs d'origine
+    # if active.sum().item() == 0:
+    #     best_idx = int(torch.argmax(probs).item())
+    #     # Respecter nos règles: si best=BACKWARD mais FORWARD passe le seuil, on préfère FORWARD
+    #     if best_idx == IDX_BACKWARD and (probs[IDX_FORWARD] > threshold):
+    #         best_idx = IDX_FORWARD
+    #     active[best_idx] = 1
 
     # 7) Mapping indices -> noms en gardant l’ordre fixe 0..3
     driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3: "BACKWARD"}
+    
     chosen = [driving_inputs[i] for i in range(4) if active[i].item() == 1]
+    logger.info(chosen)
     return chosen
 
 
