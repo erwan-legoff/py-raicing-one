@@ -182,11 +182,11 @@ def compute_reward(historyPoint: HistoryPoint) -> float:
         # Pour aller à gauche, la vitesse doit être négative
         # Donc si elle est positive on récompense par rapport à la vitesse et si elle est négative on punit
         if(result_left_sensor < 2):
-            reward += result_x_speed*5*(2-result_left_sensor)
+            reward += result_x_speed*15*(2-result_left_sensor)
         # Pour aller à droite, la vitesse doit être positive
         # Donc si elle est négative on récompense par rapport à la vitesse et si elle est positive on punit
         if(result_right_sensor < 2):
-            reward += -result_x_speed*5*(2-result_right_sensor)
+            reward += -result_x_speed*15*(2-result_right_sensor)
 
         
         # Si on avance peu ou qu'on recule légèrement, on punit de 10
@@ -195,6 +195,7 @@ def compute_reward(historyPoint: HistoryPoint) -> float:
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
         reward += result_z_speed * 10
+        reward += 10 - 10* (result_left_sensor - result_right_sensor) / ((result_left_sensor + result_right_sensor) / 10) 
 
         return reward
 import math
@@ -231,7 +232,7 @@ def normalize_inputs(values: list[float]) -> torch.Tensor:
     return torch.clamp(normalized, 0.0, 1.0)
 
 def process_rewards(simulation_history: list[HistoryPoint]) -> torch.Tensor:
-    """Nettoie, normalise et logge les rewards pour le training."""
+    """Nettoie, normalise et log les rewards pour le training."""
     raw_rewards = [h.reward for h in simulation_history]
     rewards = torch.tensor(raw_rewards, dtype=torch.float32, device=device)
 
@@ -482,7 +483,9 @@ async def websocket_endpoint(ws: WebSocket):
                 train()
                 save_simulation_history(simulation_history)
                 simulation_history.clear()
-
+            # logger.info(chosen)
+            if(chosen.__contains__("BACKWARD")):
+                logger.info("❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️")
             await ws.send_json({"driving_inputs": chosen})
             simulation_history.append(new_history_point)
     except Exception as e:
@@ -497,7 +500,7 @@ def predict_actions(payload, i = 0):
         simulation_history[-1].world_result = payload
         reward = compute_reward(simulation_history[-1])
         # Log reward seulement toutes les 10 frames pour réduire le bruit
-        if frame_idx % 3 == 0:
+        if frame_idx % 1 == 0:
             logger.info(f"Trained Count: {auto_pilot.training_count:.2f}👌")
             logger.info(f"Frame {frame_idx}")
             logger.info(f"👌Reward: {reward:.0f}👌")
@@ -523,7 +526,7 @@ def predict_actions(payload, i = 0):
     with torch.no_grad():
         logits = auto_pilot(data_input)
 
-        chosen = choose_actions_tensor(logits, threshold=0.4, device=device)
+        chosen_names, action_mask = choose_actions_tensor(logits, threshold=0.4, device=device, frame=payload.get("frameId", 0))
 
 
     # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
@@ -533,21 +536,24 @@ def predict_actions(payload, i = 0):
         curr_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
         curr_x_speed = float(payload.get("speeds", {}).get("x", 0.0))
             
-        logger.info(f"curr_z: {curr_z:.3f} | curr_x_speed: {curr_x_speed:.3f}")
-        logger.info(f"Inputs: {[round(v, 2) for v in values]}")
+        # logger.info(f"curr_z: {curr_z:.3f} | curr_x_speed: {curr_x_speed:.3f}")
+        # logger.info(f"Inputs: {[round(v, 2) for v in values]}")
         # log normalized inputs            
     new_history_point.input = values
-    new_history_point.output = chosen 
+    new_history_point.output = action_mask  
     if frame_idx % 3 == 0:
-        logger.info(f"Actions: {chosen}")
-    return new_history_point,chosen
+        logger.info(f"Actions: {chosen_names}")
+    return new_history_point,chosen_names
 
 # Indices: 0=LEFT, 1=FORWARD, 2=RIGHT, 3=BACKWARD
 IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
 
 def choose_actions_tensor(logits: torch.Tensor,
+                          frame,
                           threshold: float = 0.4,
-                          device: torch.device = torch.device("cpu")) -> list[str]:
+                          device: torch.device = torch.device("cpu"),
+                          frame_before_side = 200,
+                          frame_before_interaction = 1) -> tuple[list[str], list[int]]:
     """
     Pipeline propre:
     - probs = sigmoid(logits)
@@ -579,6 +585,13 @@ def choose_actions_tensor(logits: torch.Tensor,
         else:
             mask[IDX_LEFT] = False
 
+    if frame < frame_before_side:
+         mask[IDX_RIGHT] = False
+         mask[IDX_LEFT] = False
+         mask[IDX_BACKWARD] = False
+    if frame < frame_before_interaction:
+        mask[IDX_FORWARD] = False
+
     # 4) Appliquer le masque aux probabilités
     masked_probs = probs.clone()
     masked_probs[~mask] = 0.0
@@ -598,10 +611,10 @@ def choose_actions_tensor(logits: torch.Tensor,
 
     # 7) Mapping indices -> noms en gardant l’ordre fixe 0..3
     driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3: "BACKWARD"}
-    
-    chosen = [driving_inputs[i] for i in range(4) if active[i].item() == 1]
-    logger.info(chosen)
-    return chosen
+    chosen_names = [driving_inputs[i] for i in range(4) if active[i].item() == 1]
+    action_mask = [int(active[i].item()) for i in range(4)]  # <-- toujours longueur 4
+
+    return chosen_names, action_mask
 
 
     
