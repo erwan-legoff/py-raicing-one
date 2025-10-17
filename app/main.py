@@ -7,6 +7,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -141,7 +142,7 @@ def periodic_auto_save(simulation_history):
 if __name__ == "__main__":
     periodic_auto_save(simulation_history)
 
-def compute_reward(historyPoint: HistoryPoint) -> float:
+def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, frame_before_interaction:int ,frame_idx:int) -> float:
         """
         Calcule la récompense (reward) entre deux états successifs de simulation.
         - Pénalise fort si la voiture tombe sous la route
@@ -154,6 +155,9 @@ def compute_reward(historyPoint: HistoryPoint) -> float:
         position_result = world_result.get("positions", {}).get("car", {})
         position_input = world_input.get("positions", {}).get("car", {})
 
+        input_left_sensor = world_input.get("sensors",{}).get("left45Ray",  0)
+        input_right_sensor = world_input.get("sensors",{}).get("right45Ray",  0)
+
         result_left_sensor = world_result.get("sensors",{}).get("left45Ray",  0)
         result_right_sensor = world_result.get("sensors", {}).get("right45Ray", 0)
         # On inverse l’axe Z pour que avancer → reward positif
@@ -165,37 +169,68 @@ def compute_reward(historyPoint: HistoryPoint) -> float:
         input_position_z = -position_input.get("z", 0.0)
         result_position_z = -position_result.get("z", 0.0)
         result_position_y = position_result.get("y", 0.0)
+        input_position_x = position_input.get("x", 0.0)
+        result_position_x = position_result.get("x", 0.0)
+        road_width = road_size.get("width",0)
+        car_width = car_size.get("width",0)
         reward = 0
         # Vérifie que les positions sont valides
         if not position_result or not position_input:
             return 0.0 
-
+        if frame_idx <= frame_before_interaction:
+            return 0.0
+        road_length = (road_size.get("depth",0) / 2) - 10 
+        if(abs(result_position_z) > road_length):
+            return 100
         # Punition si la voiture est tombée sous la route
         if result_position_y < road_pos.get("y", 0):
             return -10 * abs(result_x_speed)
 
-        # Si la revient au début, c'est que la prédiction est mauvaise, on punit
+        
+        # Si la voiture revient au début, c'est que la prédiction est mauvaise, on punit
         if(input_position_z > 5 and result_position_z < 1):
             return -100
+        # Road width = 5 
+        # Car Width = 1
+        x_max = (road_width/2) - (car_width/2)
+        x_min = x_max - (x_max - car_width*2)
+        if(x_min < abs(input_position_x)):
+            logger.info("🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴")
+        side_proximity_ration = min(abs(result_position_x) / x_max, 1)
+        # Si on était pas dehors mais que l'action fait sortir
+        # alors on punit et on ajoute une punition proportionnel à l'engouement vers x
+        if(abs(result_position_x) > x_max and abs(input_position_x) < x_max):
+            return -100 - 10 * abs(result_position_x) - abs(input_position_x)
+        # Si on était déjà dehors alors on punit et ajoute une proportionalité à l'engouement vers x
+        if(abs(result_position_x) > x_max and abs(input_position_x) > x_max):
+            return -10 - 10 * abs(result_position_x) - abs(input_position_x)
+        # Si on était pas dans X et qu'on rentre dedans, alors on ajoute une punition avec une proportionnalité de l'engouement vers x
+        if(abs(result_position_x)>x_min and abs(input_position_x) < x_min):
+            reward -= 10 + 10 * (abs(result_position_x) - abs(input_position_x))
+        # Si on se dirige vers x, et que de base on était dans la zone dangereuse
+        # alors on punit de plus en plus qu'on s'approche du bord
+        if(abs(result_position_x) > abs(input_position_x) and abs(input_position_x) > x_min):
+            reward -= 30 * result_z_speed * side_proximity_ration**3
+        # Si on se pars de x, et que de base on était dans la zone dangereuse
+        # alors on récompense proportionnellement à la proximité
+        if(abs(result_position_x) < abs(input_position_x) and abs(input_position_x) > x_min):
+            reward += result_z_speed * side_proximity_ration
 
-        # Quand on s'approche d'un côté, on punit proportionnellement à la vitesse vers ce côté et à la proximité
-        # Pour aller à gauche, la vitesse doit être négative
-        # Donc si elle est positive on récompense par rapport à la vitesse et si elle est négative on punit
-        if(result_left_sensor < 2):
-            reward += result_x_speed*15*(2-result_left_sensor)
-        # Pour aller à droite, la vitesse doit être positive
-        # Donc si elle est négative on récompense par rapport à la vitesse et si elle est positive on punit
-        if(result_right_sensor < 2):
-            reward += -result_x_speed*15*(2-result_right_sensor)
-
+        # Si on sort de la zone dangereuse on a un petit bonus
+        if(abs(input_position_x) > x_min and abs(result_position_x) < x_min):
+            reward += 10
+            
         
         # Si on avance peu ou qu'on recule légèrement, on punit de 10
         if(result_z_speed < 0.2 and result_z_speed >= -1):
             reward += -10
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
-        reward += result_z_speed * 10
-        reward += 10 - 10* (result_left_sensor - result_right_sensor) / ((result_left_sensor + result_right_sensor) / 10) 
+        centric_reward = 40 * result_z_speed * (min(1,1 - abs(result_position_x) /(x_min/1.2)))
+        reward += centric_reward
+        if(abs(input_position_x) < abs(result_position_x)):
+            reward += 10
+       
 
         return reward
 import math
@@ -370,7 +405,7 @@ def load_simulation_from_file(path: str) -> list[HistoryPoint]:
         logger.error(f"❌ Erreur de lecture du fichier {path} : {e}")
         return []
 
-def load_latest_model(model: nn.Module, directory: str = "models") -> bool:
+def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") -> bool:
     """
     Recharge automatiquement le dernier modèle sauvegardé (le plus récent)
     depuis le dossier spécifié.
@@ -463,8 +498,8 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("✅ WebSocket connection established")
-    prediction_seconds_before_learning = 60
-    fps = 4
+    prediction_seconds_before_learning = 120
+    fps = 8
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     predictions_count: int = 0
     try:
@@ -482,10 +517,29 @@ async def websocket_endpoint(ws: WebSocket):
                 predictions_count = 0
                 train()
                 save_simulation_history(simulation_history)
-                simulation_history.clear()
+                # simulation_history.clear()
             # logger.info(chosen)
             if(chosen.__contains__("BACKWARD")):
                 logger.info("❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️")
+            # Si la position précédente ET la position résultante sont toutes deux hors de x_max,
+            # demander un RESET à la simulation via le WebSocket.
+            # On récupère les positions depuis le dernier world_input (si existant) et depuis le payload courant.
+            try:
+                if len(simulation_history) > 0:
+                    prev_input = simulation_history[-1].world_input or {}
+                    input_position_x = float(prev_input.get("positions", {}).get("car", {}).get("x", 0.0))
+                    result_position_x = float(payload.get("positions", {}).get("car", {}).get("x", 0.0))
+
+                    road_width = float(payload.get("roadSize", {}).get("width", 0))
+                    car_width = float(payload.get("carSize", {}).get("width", 0))
+                    # calcul de x_max identique à compute_reward
+                    x_max = (road_width / 2) - (car_width / 2) if (road_width and car_width) else None
+
+                    if x_max is not None and (abs(result_position_x) > x_max and abs(input_position_x) > x_max):
+                        logger.info("🔁 Condition bord route détectée — envoi d'un RESET au simulateur")
+                        await ws.send_json({"driving_inputs": ["RESET"]})
+            except Exception as e:
+                logger.warning(f"⚠️ Erreur lors du test de reset automatique: {e}")
             await ws.send_json({"driving_inputs": chosen})
             simulation_history.append(new_history_point)
     except Exception as e:
@@ -493,16 +547,16 @@ async def websocket_endpoint(ws: WebSocket):
         logger.warning(f"⚠️ WebSocket closed: {e}")
 IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
 def predict_actions(payload, i = 0):
+    frame_before_interaction = 200
     # i contient l'indice (ou compteur) de la frame actuelle depuis la boucle websocket
     frame_idx = int(i)
+    frame = payload.get("frameId", 0)
     if(len(simulation_history) > 0):
         # Ceci est le résultat de la prédiction précédente
         simulation_history[-1].world_result = payload
-        reward = compute_reward(simulation_history[-1])
-        # Log reward seulement toutes les 10 frames pour réduire le bruit
+        reward = compute_reward(simulation_history[-1], road_size= payload.get("roadSize"), car_size= payload.get("carSize"), frame_before_interaction=frame_before_interaction, frame_idx=frame)
+        # Log reward seulement toutes les 10 frames pour réduire le bruit        
         if frame_idx % 1 == 0:
-            logger.info(f"Trained Count: {auto_pilot.training_count:.2f}👌")
-            logger.info(f"Frame {frame_idx}")
             logger.info(f"👌Reward: {reward:.0f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
@@ -525,8 +579,7 @@ def predict_actions(payload, i = 0):
 
     with torch.no_grad():
         logits = auto_pilot(data_input)
-
-        chosen_names, action_mask = choose_actions_tensor(logits, threshold=0.4, device=device, frame=payload.get("frameId", 0))
+        chosen_names, action_mask = choose_actions_tensor(logits, threshold=0.4, device=device, frame=frame, frame_before_interaction=frame_before_interaction)
 
 
     # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
@@ -552,8 +605,8 @@ def choose_actions_tensor(logits: torch.Tensor,
                           frame,
                           threshold: float = 0.4,
                           device: torch.device = torch.device("cpu"),
-                          frame_before_side = 200,
-                          frame_before_interaction = 1) -> tuple[list[str], list[int]]:
+                          frame_before_side = 800,
+                          frame_before_interaction = 200) -> tuple[list[str], list[int]]:
     """
     Pipeline propre:
     - probs = sigmoid(logits)
@@ -617,9 +670,4 @@ def choose_actions_tensor(logits: torch.Tensor,
     return chosen_names, action_mask
 
 
-    
 
-
-
-
-        
