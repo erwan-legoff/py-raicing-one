@@ -9,7 +9,8 @@ from torchvision import datasets, transforms
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+predictions_count: int = 0
+predictions_since_training: int = 0
 
 app = FastAPI()
 
@@ -494,57 +495,78 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
     torch.save(model.state_dict(), path)
     # logger.info(f"💾 Modèle sauvegardé dans {path}")
 
+
+
+async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_history: list[HistoryPoint]) -> bool:
+    """
+    Vérifie si la position précédente ET la position résultante dépassent x_max.
+    Si oui, envoie un RESET via le WebSocket et retourne True.
+    Retourne False sinon.
+    """
+    try:
+        if len(simulation_history) == 0:
+            return False
+        prev_input = simulation_history[-1].world_input or {}
+        input_position_x = float(prev_input.get("positions", {}).get("car", {}).get("x", 0.0))
+        result_position_x = float(payload.get("positions", {}).get("car", {}).get("x", 0.0))
+
+        road_width = float(payload.get("roadSize", {}).get("width", 0))
+        car_width = float(payload.get("carSize", {}).get("width", 0))
+        # calcul de x_max identique à compute_reward
+        if not (road_width and car_width):
+            return False
+        x_max = (road_width / 2) - (car_width / 2)
+
+        if abs(result_position_x) > x_max and abs(input_position_x) > x_max:
+            logger.info("🔁 Condition bord route détectée — envoi d'un RESET au simulateur")
+            await ws.send_json({"driving_inputs": ["RESET"]})
+            return True
+    except Exception as e:
+        logger.warning(f"⚠️ Erreur lors du test de reset automatique: {e}")
+    return False
 @app.websocket("/ai")
 async def websocket_endpoint(ws: WebSocket):
+    global predictions_count, predictions_since_training
     await ws.accept()
     logger.info("✅ WebSocket connection established")
     prediction_seconds_before_learning = 120
     fps = 8
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
-    predictions_count: int = 0
+    initial_reset_sent = False
+    
     try:
         while True:
-            if(predictions_count == 0):
+            if not initial_reset_sent:
                 await ws.send_json({"driving_inputs": ["RESET"]})
                 logger.info("🔁 Envoi d’un reset à la simulation")
+                initial_reset_sent = True
             payload = await ws.receive_json()
     
-            predictions_count = predictions_count + 1  
+            predictions_count = predictions_count + 1
+            predictions_since_training = predictions_since_training + 1
             # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
             
             new_history_point, chosen = predict_actions(payload, predictions_count)
-            if(predictions_count >= predictions_before_learning):
-                predictions_count = 0
-                train()
-                save_simulation_history(simulation_history)
+            predictions_since_training = periodically_train(predictions_before_learning, predictions_since_training)
                 # simulation_history.clear()
             # logger.info(chosen)
             if(chosen.__contains__("BACKWARD")):
                 logger.info("❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️")
-            # Si la position précédente ET la position résultante sont toutes deux hors de x_max,
-            # demander un RESET à la simulation via le WebSocket.
-            # On récupère les positions depuis le dernier world_input (si existant) et depuis le payload courant.
-            try:
-                if len(simulation_history) > 0:
-                    prev_input = simulation_history[-1].world_input or {}
-                    input_position_x = float(prev_input.get("positions", {}).get("car", {}).get("x", 0.0))
-                    result_position_x = float(payload.get("positions", {}).get("car", {}).get("x", 0.0))
-
-                    road_width = float(payload.get("roadSize", {}).get("width", 0))
-                    car_width = float(payload.get("carSize", {}).get("width", 0))
-                    # calcul de x_max identique à compute_reward
-                    x_max = (road_width / 2) - (car_width / 2) if (road_width and car_width) else None
-
-                    if x_max is not None and (abs(result_position_x) > x_max and abs(input_position_x) > x_max):
-                        logger.info("🔁 Condition bord route détectée — envoi d'un RESET au simulateur")
-                        await ws.send_json({"driving_inputs": ["RESET"]})
-            except Exception as e:
-                logger.warning(f"⚠️ Erreur lors du test de reset automatique: {e}")
+            sent = await maybe_send_positional_reset(ws, payload, simulation_history)
+            if sent:
+                continue
             await ws.send_json({"driving_inputs": chosen})
             simulation_history.append(new_history_point)
     except Exception as e:
         save_simulation_history(simulation_history)
         logger.warning(f"⚠️ WebSocket closed: {e}")
+
+def periodically_train(predictions_before_learning: int, predictions_since_training: int) -> int:
+    if(predictions_since_training >= predictions_before_learning):
+        train()
+        save_simulation_history(simulation_history)
+        return 0
+    return predictions_since_training
 IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
 def predict_actions(payload, i = 0):
     frame_before_interaction = 200
