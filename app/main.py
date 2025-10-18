@@ -49,10 +49,13 @@ class AutoPilot(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
         super().__init__()
         self.input_layer = nn.Linear(input_size,hidden_size, device=device)
+        self.layer_normalization_1 = nn.LayerNorm(hidden_size)
         self.non_linear_1 = nn.ReLU()
         self.hidden_layer_1 = nn.Linear(hidden_size,hidden_size, device=device)
+        self.layer_normalization_2 = nn.LayerNorm(hidden_size)
         self.non_linear_2 = nn.ReLU()
         self.hidden_layer_2 = nn.Linear(hidden_size,hidden_size//2, device=device)
+        self.layer_normalization_3 = nn.LayerNorm(hidden_size // 2)
         self.non_linear_3 = nn.ReLU()
         self.output_layer = nn.Linear(hidden_size//2,output_size, device=device)
         self.training_count = 0  # Compteur d'itérations d'entraînement
@@ -67,14 +70,19 @@ class AutoPilot(nn.Module):
         super().load_state_dict(state_dict, strict)
 
     def forward(self, inputs):
-        inputs = self.input_layer(inputs)
-        inputs = self.non_linear_1(inputs)
-        inputs = self.hidden_layer_1(inputs)
-        inputs = self.non_linear_2(inputs)
-        inputs = self.hidden_layer_2(inputs)
-        inputs = self.non_linear_3(inputs)
-        inputs = self.output_layer(inputs)
-        return inputs
+        x = self.input_layer(inputs)
+        x = self.layer_normalization_1(x)
+        x = self.non_linear_1(x)
+
+        x = self.hidden_layer_1(x)
+        x = self.layer_normalization_2(x)
+        x = self.non_linear_2(x)
+
+        x = self.hidden_layer_2(x)
+        x = self.layer_normalization_3(x)
+        x = self.non_linear_3(x)
+
+        return self.output_layer(x)
     
 input_size = 13  # 7 capteurs + 3 vitesses + 3 accélérations
 hidden_size = 128
@@ -100,6 +108,7 @@ class HistoryPoint:
 
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
 auto_pilot.to(device)
+STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_large_straight_road_20251015_105922.pt")
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 simulation_history: list[HistoryPoint] = []
 import json
@@ -143,6 +152,33 @@ def periodic_auto_save(simulation_history):
 if __name__ == "__main__":
     periodic_auto_save(simulation_history)
 
+def reward_emoji(value: float) -> str:
+    if value >= 300:
+        return "🏆"
+    if value >= 50:
+        return "🎉"
+    if value > 0:
+        return "😄"
+    if value <= -500:
+        return "💀"
+    if value <= -100:
+        return "🔥"
+    if value < 0:
+        return "😤"
+    return "😐"
+
+def log_reward(value: float, reason: str) -> float:
+    emoji = reward_emoji(value)
+    logger.info(f"{emoji} Reward ({reason}): {value:.2f}")
+    return value
+
+def log_reward_update(current: float, delta: float, reason: str) -> float:
+    new_value = current + delta
+    emoji = reward_emoji(delta)
+    total_emoji = reward_emoji(new_value)
+    logger.info(f"{emoji} Reward update ({reason}): {delta:+.2f} -> {total_emoji} total {new_value:.2f}")
+    return new_value
+
 def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, frame_before_interaction:int ,frame_idx:int) -> float:
         """
         Calcule la récompense (reward) entre deux états successifs de simulation.
@@ -177,20 +213,20 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         reward = 0
         # Vérifie que les positions sont valides
         if not position_result or not position_input:
-            return 0.0 
+            return log_reward(0.0, "positions invalides")
         if frame_idx <= frame_before_interaction:
-            return 0.0
+            return log_reward(0.0, "début d'épisode")
         road_length = (road_size.get("depth",0) / 2) - 10 
         if(abs(result_position_z) > road_length):
-            return 100
+            return log_reward(100, "franchissement de la ligne d'arrivée")
         # Punition si la voiture est tombée sous la route
         if result_position_y < road_pos.get("y", 0):
-            return -10 * abs(result_x_speed)
+            return log_reward(-10 * abs(result_x_speed), "chute sous la route")
 
         
         # Si la voiture revient au début, c'est que la prédiction est mauvaise, on punit
         if(input_position_z > 5 and result_position_z < 1):
-            return -100
+            return log_reward(-100, "retour au départ")
         # Road width = 5 
         # Car Width = 1
         x_max = (road_width/2) - (car_width/2)
@@ -201,39 +237,43 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         # Si on était pas dehors mais que l'action fait sortir
         # alors on punit et on ajoute une punition proportionnel à l'engouement vers x
         if(abs(result_position_x) > x_max and abs(input_position_x) < x_max):
-            return -100 - 10 * abs(result_position_x) - abs(input_position_x)
+            return log_reward(-100 - 10 * abs(result_position_x) - abs(input_position_x), "sortie de route")
         # Si on était déjà dehors alors on punit et ajoute une proportionalité à l'engouement vers x
         if(abs(result_position_x) > x_max and abs(input_position_x) > x_max):
-            return -10 - 10 * abs(result_position_x) - abs(input_position_x)
+            return log_reward(-10 - 10 * abs(result_position_x) - abs(input_position_x), "persistance hors route")
         # Si on était pas dans X et qu'on rentre dedans, alors on ajoute une punition avec une proportionnalité de l'engouement vers x
         if(abs(result_position_x)>x_min and abs(input_position_x) < x_min):
-            reward -= 10 + 10 * (abs(result_position_x) - abs(input_position_x))
+            delta = -(10 + 5 * (abs(result_position_x) - abs(input_position_x)))
+            reward = log_reward_update(reward, delta, "entrée zone dangereuse")
         # Si on se dirige vers x, et que de base on était dans la zone dangereuse
         # alors on punit de plus en plus qu'on s'approche du bord
         if(abs(result_position_x) > abs(input_position_x) and abs(input_position_x) > x_min):
-            reward -= 30 * result_z_speed * side_proximity_ration**3
+            delta = -55*result_z_speed * side_proximity_ration**2
+            reward = log_reward_update(reward, delta, "approche du bord")
         # Si on se pars de x, et que de base on était dans la zone dangereuse
         # alors on récompense proportionnellement à la proximité
         if(abs(result_position_x) < abs(input_position_x) and abs(input_position_x) > x_min):
-            reward += 5*result_z_speed * side_proximity_ration
+            delta = 4*result_z_speed * side_proximity_ration**2
+            reward = log_reward_update(reward, delta, "éloignement du bord")
 
         # Si on sort de la zone dangereuse on a un petit bonus
         if(abs(input_position_x) > x_min and abs(result_position_x) < x_min):
-            reward += 10
+            reward = log_reward_update(reward, 10, "sortie zone dangereuse")
             
         
         # Si on avance peu ou qu'on recule légèrement, on punit de 10
         if(result_z_speed < 0.2 and result_z_speed >= -1):
-            reward += -10
+            reward = log_reward_update(reward, -10, "vitesse avant insuffisante")
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
-        centric_reward = 20 * result_z_speed * (min(1,1 - abs(result_position_x) /(x_min/1.2)))
-        reward += centric_reward
-        if(abs(input_position_x) < abs(result_position_x)):
-            reward += result_z_speed
-       
+        centric_reward = 40 * result_z_speed * (max(0,1 - abs(result_position_x) /(x_min/1.2)))
+        reward = log_reward_update(reward, centric_reward, "progression axiale")
+        # if(abs(input_position_x) > abs(result_position_x)):
+        #     delta = 5*result_z_speed
+        #     reward = log_reward_update(reward, delta, "recentrage latéral")
 
-        return reward
+
+        return log_reward(reward, "cumul")
 import math
 import torch.optim as optim
 optimizer = optim.Adam(auto_pilot.parameters(), lr=1e-4)
@@ -406,6 +446,31 @@ def load_simulation_from_file(path: str) -> list[HistoryPoint]:
         logger.error(f"❌ Erreur de lecture du fichier {path} : {e}")
         return []
 
+def load_model_from_path(path: str, model: nn.Module = auto_pilot) -> bool:
+    """
+    Charge un modèle précis depuis un chemin complet.
+
+    Args:
+        path (str): chemin vers le fichier .pt
+        model (nn.Module): instance à recharger
+
+    Returns:
+        bool: True si le chargement a réussi, False sinon
+    """
+    if not os.path.exists(path):
+        logger.warning(f"⚠️ Modèle introuvable: {path}")
+        return False
+
+    try:
+        state = torch.load(path, map_location=device)
+        model.load_state_dict(state)
+        model.to(device)
+        logger.info(f"📂 Modèle chargé : {os.path.basename(path)} sur {device}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Échec du chargement du modèle {path}: {e}")
+        return False
+
 def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") -> bool:
     """
     Recharge automatiquement le dernier modèle sauvegardé (le plus récent)
@@ -432,14 +497,10 @@ def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") 
     latest_file = files[0]
     latest_path = os.path.join(directory, latest_file)
 
-    try:
-        model.load_state_dict(torch.load(latest_path, map_location=device))
-        model.to(device)
-        logger.info(f"📂 Modèle rechargé : {latest_file} sur {device}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ Échec du chargement de {latest_file} : {e}")
-        return False
+    return load_model_from_path(latest_path, model)
+
+# # Chargement du modèle par défaut au démarrage
+# load_model_from_path(STARTUP_MODEL_PATH)
 
 def train_from_file(directory: str = "sessions"):
     """
@@ -489,7 +550,7 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"autopilot_{timestamp}.pt"
+        filename = f"autopilot_v2_{timestamp}.pt"
 
     path = os.path.join(directory, filename)
     torch.save(model.state_dict(), path)
@@ -517,7 +578,7 @@ async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_h
             return False
         x_max = (road_width / 2) - (car_width / 2)
 
-        if abs(result_position_x) > x_max and abs(input_position_x) > x_max:
+        if abs(result_position_x) > x_max+2 and abs(input_position_x) > x_max:
             logger.info("🔁 Condition bord route détectée — envoi d'un RESET au simulateur")
             await ws.send_json({"driving_inputs": ["RESET"]})
             return True
@@ -555,7 +616,8 @@ async def websocket_endpoint(ws: WebSocket):
             sent = await maybe_send_positional_reset(ws, payload, simulation_history)
             if sent:
                 continue
-            await ws.send_json({"driving_inputs": chosen})
+            reward_value = simulation_history[-1].reward if simulation_history else 0.0
+            await ws.send_json({"driving_inputs": chosen, "reward": reward_value})
             simulation_history.append(new_history_point)
     except Exception as e:
         save_simulation_history(simulation_history)
