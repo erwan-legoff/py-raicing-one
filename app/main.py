@@ -194,7 +194,7 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         # Road width = 5 
         # Car Width = 1
         x_max = (road_width/2) - (car_width/2)
-        x_min = x_max - (x_max - car_width*2)
+        x_min = x_max/3
         if(x_min < abs(input_position_x)):
             logger.info("🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴")
         side_proximity_ration = min(abs(result_position_x) / x_max, 1)
@@ -215,7 +215,7 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         # Si on se pars de x, et que de base on était dans la zone dangereuse
         # alors on récompense proportionnellement à la proximité
         if(abs(result_position_x) < abs(input_position_x) and abs(input_position_x) > x_min):
-            reward += result_z_speed * side_proximity_ration
+            reward += 5*result_z_speed * side_proximity_ration
 
         # Si on sort de la zone dangereuse on a un petit bonus
         if(abs(input_position_x) > x_min and abs(result_position_x) < x_min):
@@ -227,10 +227,10 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
             reward += -10
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
-        centric_reward = 40 * result_z_speed * (min(1,1 - abs(result_position_x) /(x_min/1.2)))
+        centric_reward = 20 * result_z_speed * (min(1,1 - abs(result_position_x) /(x_min/1.2)))
         reward += centric_reward
         if(abs(input_position_x) < abs(result_position_x)):
-            reward += 10
+            reward += result_z_speed
        
 
         return reward
