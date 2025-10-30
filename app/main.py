@@ -1,4 +1,5 @@
 import logging
+import random
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -108,7 +109,7 @@ class HistoryPoint:
 
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
 auto_pilot.to(device)
-STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_large_straight_road_20251015_105922.pt")
+STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_v2_random_position_20251018_223123.pt")
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 simulation_history: list[HistoryPoint] = []
 import json
@@ -248,12 +249,12 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         # Si on se dirige vers x, et que de base on était dans la zone dangereuse
         # alors on punit de plus en plus qu'on s'approche du bord
         if(abs(result_position_x) > abs(input_position_x) and abs(input_position_x) > x_min):
-            delta = -55*result_z_speed * side_proximity_ration**2
+            delta = -55*result_z_speed * side_proximity_ration**3
             reward = log_reward_update(reward, delta, "approche du bord")
         # Si on se pars de x, et que de base on était dans la zone dangereuse
         # alors on récompense proportionnellement à la proximité
         if(abs(result_position_x) < abs(input_position_x) and abs(input_position_x) > x_min):
-            delta = 4*result_z_speed * side_proximity_ration**2
+            delta = 20*result_z_speed * side_proximity_ration**2
             reward = log_reward_update(reward, delta, "éloignement du bord")
 
         # Si on sort de la zone dangereuse on a un petit bonus
@@ -266,7 +267,7 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
             reward = log_reward_update(reward, -10, "vitesse avant insuffisante")
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
-        centric_reward = 40 * result_z_speed * (max(0,1 - abs(result_position_x) /(x_min/1.2)))
+        centric_reward = 30 * result_z_speed * (max(0,1 - abs(result_position_x) /(x_min)))
         reward = log_reward_update(reward, centric_reward, "progression axiale")
         # if(abs(input_position_x) > abs(result_position_x)):
         #     delta = 5*result_z_speed
@@ -500,7 +501,7 @@ def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") 
     return load_model_from_path(latest_path, model)
 
 # # Chargement du modèle par défaut au démarrage
-# load_model_from_path(STARTUP_MODEL_PATH)
+load_model_from_path(STARTUP_MODEL_PATH)
 
 def train_from_file(directory: str = "sessions"):
     """
@@ -563,6 +564,7 @@ async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_h
     Vérifie si la position précédente ET la position résultante dépassent x_max.
     Si oui, envoie un RESET via le WebSocket et retourne True.
     Retourne False sinon.
+    Inclut également un reset aléatoire (1/10) quand la voiture avance peu mais est déjà loin.
     """
     try:
         if len(simulation_history) == 0:
@@ -570,6 +572,13 @@ async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_h
         prev_input = simulation_history[-1].world_input or {}
         input_position_x = float(prev_input.get("positions", {}).get("car", {}).get("x", 0.0))
         result_position_x = float(payload.get("positions", {}).get("car", {}).get("x", 0.0))
+        result_position_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
+        result_z_speed = float(payload.get("speeds", {}).get("z", 0.0))
+
+        if abs(result_z_speed) < 0.5 and abs(result_position_z) > 1 and random.randint(1, 10) == 1:
+            logger.info("🎲 Reset aléatoire déclenché (faible vitesse, position avancée)")
+            await ws.send_json({"driving_inputs": ["RESET"]})
+            return True
 
         road_width = float(payload.get("roadSize", {}).get("width", 0))
         car_width = float(payload.get("carSize", {}).get("width", 0))
@@ -663,7 +672,7 @@ def predict_actions(payload, i = 0):
 
     with torch.no_grad():
         logits = auto_pilot(data_input)
-        chosen_names, action_mask = choose_actions_tensor(logits, threshold=0.4, device=device, frame=frame, frame_before_interaction=frame_before_interaction)
+        chosen_names, action_mask = choose_actions_tensor(logits, threshold=0.2, device=device, frame=frame, frame_before_interaction=frame_before_interaction)
 
 
     # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
