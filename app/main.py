@@ -111,7 +111,7 @@ auto_pilot = AutoPilot(input_size,hidden_size,output_size)
 auto_pilot.to(device)
 STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_v2_random_position_20251018_223123.pt")
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
-simulation_history: list[HistoryPoint] = []
+simulation_histories: dict[str, list[HistoryPoint]] = {}
 import json
 from datetime import datetime
 SAVE_INTERVAL = 120
@@ -150,8 +150,6 @@ def periodic_auto_save(simulation_history):
     """
     save_simulation_history(simulation_history)
     threading.Timer(SAVE_INTERVAL, periodic_auto_save, args=[simulation_history]).start()
-if __name__ == "__main__":
-    periodic_auto_save(simulation_history)
 
 def reward_emoji(value: float) -> str:
     if value >= 300:
@@ -354,7 +352,10 @@ def process_rewards(simulation_history: list[HistoryPoint]) -> torch.Tensor:
 
 
 
-def train(batch_size=16, save_every=1000, resume: bool = False):
+def train(simulation_history: list[HistoryPoint],
+          batch_size: int = 16,
+          save_every: int = 1000,
+          resume: bool = False):
 
     if resume:
         loaded = load_latest_model(auto_pilot)
@@ -362,6 +363,10 @@ def train(batch_size=16, save_every=1000, resume: bool = False):
             logger.info("🔄 Modèle existant chargé, reprise de l'entraînement.")
         else:
             logger.info("🆕 Aucun modèle trouvé — entraînement à partir de zéro.")
+
+    if not simulation_history:
+        logger.warning("⚠️ Impossible d'entraîner — historique vide.")
+        return
 
     inputs = torch.stack([normalize_inputs(h.input) for h in simulation_history]).to(device)
     tries = torch.tensor([h.output for h in simulation_history], dtype=torch.float32, device=device)
@@ -526,17 +531,29 @@ def train_from_file(directory: str = "sessions"):
         if not simulation_data:
             continue
 
-        # remplace temporairement la simulation active
-        global simulation_history
-        simulation_history = simulation_data
-
-        train()
+        train(simulation_data)
         total_transitions += len(simulation_data)
 
     logger.info(f"✅ Entraînement terminé sur {len(files)} fichiers ({total_transitions} transitions)")
     # sauvegarde du modèle
     torch.save(auto_pilot.state_dict(), "autopilot_trained.pt")
     logger.info("💾 Modèle sauvegardé : autopilot_trained.pt")
+
+def full_train() -> None:
+    """
+    Entraîne successivement le modèle sur chaque historique actif en mémoire.
+    """
+    total_histories = 0
+    total_transitions = 0
+    for client_id, history in simulation_histories.items():
+        if not history:
+            logger.info(f"⚠️ Historique vide pour {client_id}, passage.")
+            continue
+        total_histories += 1
+        total_transitions += len(history)
+        logger.info(f"🚗 Entraînement sur {client_id} ({len(history)} transitions)")
+        train(history)
+    logger.info(f"🏁 full_train terminé — {total_histories} sessions, {total_transitions} transitions")
 
 def save_model(model: nn.Module, directory: str = "models", filename: str | None = None):
     """
@@ -603,6 +620,19 @@ async def websocket_endpoint(ws: WebSocket):
     fps = 8
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     initial_reset_sent = False
+    # identify client from websocket request (query param "id")
+    client_id = ws.query_params.get("id")
+    if not client_id:
+        # fallback to an anonymous id if none provided
+        client_id = f"anon_{random.randint(1, 10**9)}"
+
+    # create session entry if missing, otherwise reuse existing list
+    if client_id not in simulation_histories:
+        simulation_histories[client_id] = []
+
+    # alias l'historique de cette session pour simplifier la suite du code
+    simulation_history = simulation_histories[client_id]
+    logger.info(f"🔎 Session sélectionnée: {client_id} ({len(simulation_history)} transitions)")
     
     try:
         while True:
@@ -616,8 +646,8 @@ async def websocket_endpoint(ws: WebSocket):
             predictions_since_training = predictions_since_training + 1
             # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
             
-            new_history_point, chosen = predict_actions(payload, predictions_count)
-            predictions_since_training = periodically_train(predictions_before_learning, predictions_since_training)
+            new_history_point, chosen = predict_actions(payload, simulation_history, predictions_count)
+            predictions_since_training = periodically_train(simulation_history, predictions_before_learning, predictions_since_training)
                 # simulation_history.clear()
             # logger.info(chosen)
             if(chosen.__contains__("BACKWARD")):
@@ -632,14 +662,16 @@ async def websocket_endpoint(ws: WebSocket):
         save_simulation_history(simulation_history)
         logger.warning(f"⚠️ WebSocket closed: {e}")
 
-def periodically_train(predictions_before_learning: int, predictions_since_training: int) -> int:
+def periodically_train(simulation_history: list[HistoryPoint],
+                       predictions_before_learning: int,
+                       predictions_since_training: int) -> int:
     if(predictions_since_training >= predictions_before_learning):
-        train()
+        train(simulation_history)
         save_simulation_history(simulation_history)
         return 0
     return predictions_since_training
 IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
-def predict_actions(payload, i = 0):
+def predict_actions(payload, simulation_history: list[HistoryPoint], i: int = 0):
     frame_before_interaction = 200
     # i contient l'indice (ou compteur) de la frame actuelle depuis la boucle websocket
     frame_idx = int(i)
