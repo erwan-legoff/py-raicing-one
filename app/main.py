@@ -1,5 +1,7 @@
 import logging
 import random
+from contextlib import contextmanager
+from contextvars import ContextVar
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import os
@@ -34,7 +36,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+current_client_id: ContextVar[str] = ContextVar("current_client_id", default="global")
+
+
+class ClientIDFilter(logging.Filter):
+    """Inject the current client identifier into every log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.client_id = current_client_id.get()
+        return True
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s [client=%(client_id)s]: %(message)s",
+)
+logging.getLogger().addFilter(ClientIDFilter())
+
+
+@contextmanager
+def client_logging_context(client_id: str):
+    """Context manager ensuring logs include the originating client identifier."""
+
+    token = current_client_id.set(client_id)
+    try:
+        yield
+    finally:
+        current_client_id.reset(token)
 logger = logging.getLogger(__name__)
 
 logger.info(f"🖥️  Using device: {device} on torch {torch.__version__}")
@@ -60,14 +87,29 @@ class AutoPilot(nn.Module):
         self.non_linear_3 = nn.ReLU()
         self.output_layer = nn.Linear(hidden_size//2,output_size, device=device)
         self.training_count = 0  # Compteur d'itérations d'entraînement
+        self.last_training_at = datetime.now(timezone.utc)
 
     def state_dict(self, *args, **kwargs):
         state = super().state_dict(*args, **kwargs)
         state["_training_count"] = self.training_count
+        state["_last_training_at"] = self.last_training_at.isoformat()
         return state
-    
+
     def load_state_dict(self, state_dict, strict=True):
         self.training_count = state_dict.pop("_training_count", 0)
+        last_training_raw = state_dict.pop("_last_training_at", None)
+        if isinstance(last_training_raw, (int, float)):
+            self.last_training_at = datetime.fromtimestamp(last_training_raw, tz=timezone.utc)
+        elif isinstance(last_training_raw, str):
+            try:
+                parsed = datetime.fromisoformat(last_training_raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                self.last_training_at = parsed
+            except ValueError:
+                self.last_training_at = datetime.now(timezone.utc)
+        else:
+            self.last_training_at = datetime.now(timezone.utc)
         super().load_state_dict(state_dict, strict)
 
     def forward(self, inputs):
@@ -113,8 +155,19 @@ STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_v2_random_position_
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 simulation_histories: dict[str, list[HistoryPoint]] = {}
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 SAVE_INTERVAL = 120
+
+
+def get_training_metadata() -> dict[str, object]:
+    """Return the latest training statistics shared with the simulator UI."""
+
+    last_training_at = getattr(auto_pilot, "last_training_at", datetime.now(timezone.utc))
+    return {
+        "count": getattr(auto_pilot, "training_count", 0),
+        "last": last_training_at.isoformat(),
+    }
+
 def save_simulation_history(simulation_history, directory="sessions"):
     """
     Sauvegarde la simulation actuelle dans un fichier JSON horodaté.
@@ -421,6 +474,7 @@ def train(simulation_history: list[HistoryPoint],
         if save_every > 0 and (batch_id + 1) % save_every == 0:
             save_model(auto_pilot)
     auto_pilot.training_count += 1
+    auto_pilot.last_training_at = datetime.now(timezone.utc)
     logger.info(f"🚀 Entraînement n°{auto_pilot.training_count} fini")
     logger.info("🖥️" * 30)
     
@@ -575,8 +629,29 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
     # logger.info(f"💾 Modèle sauvegardé dans {path}")
 
 
+async def send_control_message(
+    ws: WebSocket,
+    client_id: str,
+    driving_inputs: list[str],
+    reward: float | None = None,
+) -> None:
+    """Send driving instructions enriched with training metadata to the client."""
 
-async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_history: list[HistoryPoint]) -> bool:
+    response: dict[str, object] = {
+        "driving_inputs": driving_inputs,
+        "training": get_training_metadata(),
+    }
+    if reward is not None:
+        response["reward"] = reward
+    await ws.send_json(response)
+
+
+async def maybe_send_positional_reset(
+    ws: WebSocket,
+    payload: dict,
+    simulation_history: list[HistoryPoint],
+    client_id: str,
+) -> bool:
     """
     Vérifie si la position précédente ET la position résultante dépassent x_max.
     Si oui, envoie un RESET via le WebSocket et retourne True.
@@ -594,7 +669,7 @@ async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_h
 
         if abs(result_z_speed) < 0.5 and abs(result_position_z) > 1 and random.randint(1, 10) == 1:
             logger.info("🎲 Reset aléatoire déclenché (faible vitesse, position avancée)")
-            await ws.send_json({"driving_inputs": ["RESET"]})
+            await send_control_message(ws, client_id, ["RESET"])
             return True
 
         road_width = float(payload.get("roadSize", {}).get("width", 0))
@@ -606,7 +681,7 @@ async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_h
 
         if abs(result_position_x) > x_max+2 and abs(input_position_x) > x_max:
             logger.info("🔁 Condition bord route détectée — envoi d'un RESET au simulateur")
-            await ws.send_json({"driving_inputs": ["RESET"]})
+            await send_control_message(ws, client_id, ["RESET"])
             return True
     except Exception as e:
         logger.warning(f"⚠️ Erreur lors du test de reset automatique: {e}")
@@ -615,7 +690,6 @@ async def maybe_send_positional_reset(ws: WebSocket, payload: dict, simulation_h
 async def websocket_endpoint(ws: WebSocket):
     global predictions_count, predictions_since_training
     await ws.accept()
-    logger.info("✅ WebSocket connection established")
     prediction_seconds_before_learning = 120
     fps = 8
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
@@ -632,35 +706,39 @@ async def websocket_endpoint(ws: WebSocket):
 
     # alias l'historique de cette session pour simplifier la suite du code
     simulation_history = simulation_histories[client_id]
-    logger.info(f"🔎 Session sélectionnée: {client_id} ({len(simulation_history)} transitions)")
-    
-    try:
-        while True:
-            if not initial_reset_sent:
-                await ws.send_json({"driving_inputs": ["RESET"]})
-                logger.info("🔁 Envoi d’un reset à la simulation")
-                initial_reset_sent = True
-            payload = await ws.receive_json()
-    
-            predictions_count = predictions_count + 1
-            predictions_since_training = predictions_since_training + 1
-            # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
-            
-            new_history_point, chosen = predict_actions(payload, simulation_history, predictions_count)
-            predictions_since_training = periodically_train(simulation_history, predictions_before_learning, predictions_since_training)
-                # simulation_history.clear()
-            # logger.info(chosen)
-            if(chosen.__contains__("BACKWARD")):
-                logger.info("❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️")
-            sent = await maybe_send_positional_reset(ws, payload, simulation_history)
-            if sent:
-                continue
-            reward_value = simulation_history[-1].reward if simulation_history else 0.0
-            await ws.send_json({"driving_inputs": chosen, "reward": reward_value})
-            simulation_history.append(new_history_point)
-    except Exception as e:
-        save_simulation_history(simulation_history)
-        logger.warning(f"⚠️ WebSocket closed: {e}")
+    with client_logging_context(client_id):
+        logger.info("✅ WebSocket connection established")
+        logger.info(f"🔎 Session sélectionnée: {client_id} ({len(simulation_history)} transitions)")
+
+        try:
+            while True:
+                if not initial_reset_sent:
+                    await send_control_message(ws, client_id, ["RESET"])
+                    logger.info("🔁 Envoi d’un reset à la simulation")
+                    initial_reset_sent = True
+                payload = await ws.receive_json()
+
+                predictions_count = predictions_count + 1
+                predictions_since_training = predictions_since_training + 1
+                # payload = { "sensors": {...}, "speeds": {...}, "accelerations": {...} }
+
+                new_history_point, chosen = predict_actions(payload, simulation_history, predictions_count)
+                predictions_since_training = periodically_train(
+                    simulation_history,
+                    predictions_before_learning,
+                    predictions_since_training,
+                )
+                if chosen.__contains__("BACKWARD"):
+                    logger.info("❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️")
+                sent = await maybe_send_positional_reset(ws, payload, simulation_history, client_id)
+                if sent:
+                    continue
+                reward_value = simulation_history[-1].reward if simulation_history else 0.0
+                await send_control_message(ws, client_id, chosen, reward_value)
+                simulation_history.append(new_history_point)
+        except Exception as e:
+            save_simulation_history(simulation_history)
+            logger.warning(f"⚠️ WebSocket closed: {e}")
 
 def periodically_train(simulation_history: list[HistoryPoint],
                        predictions_before_learning: int,
