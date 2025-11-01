@@ -2,8 +2,10 @@ import logging
 import random
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+import json
 import os
 import torch
 from torch import nn
@@ -46,11 +48,28 @@ class ClientIDFilter(logging.Filter):
         record.client_id = current_client_id.get()
         return True
 
+
+class ClientIDFormatter(logging.Formatter):
+    """Ensure every log record carries a `client_id`, even if filters were skipped."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "client_id"):
+            record.client_id = current_client_id.get()
+        return super().format(record)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s [client=%(client_id)s]: %(message)s",
 )
 logging.getLogger().addFilter(ClientIDFilter())
+# Replace default formatters so missing client_id becomes impossible.
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(
+        ClientIDFormatter("%(asctime)s [%(levelname)s] %(name)s [client=%(client_id)s]: %(message)s")
+    )
+# Ensure third-party loggers that don't inherit root filters still get `client_id`.
+for _third_party_logger in ("uvicorn", "uvicorn.error", "uvicorn.access", "watchfiles"):
+    logging.getLogger(_third_party_logger).addFilter(ClientIDFilter())
 
 
 @contextmanager
@@ -154,8 +173,6 @@ auto_pilot.to(device)
 STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_v2_random_position_20251018_223123.pt")
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 simulation_histories: dict[str, list[HistoryPoint]] = {}
-import json
-from datetime import datetime, timezone
 SAVE_INTERVAL = 120
 
 
