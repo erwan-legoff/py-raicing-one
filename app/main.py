@@ -185,7 +185,7 @@ class HistoryPoint:
 
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
 auto_pilot.to(device)
-STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_v2_random_position_20251018_223123.pt")
+STARTUP_MODEL_PATH = os.path.join("saved_models", "autopilot_v3_slow_20251102_164846.pt")
 driving_inputs = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3:"BACKWARD"}
 simulation_histories: dict[str, list[HistoryPoint]] = {}
 SAVE_INTERVAL = 120
@@ -244,8 +244,8 @@ def clean_history(simulation_history: list[HistoryPoint],
     rand = rng.random if rng is not None else random.random
     protected_tags = {"DANGEROUS_SIDE", "NEW_OFFROAD", "STILL_OFFROAD"}
     default_probabilities: dict[str, float] = {
-        "CENTERED": 1 / 3,
-        "BORING_CENTERED": 0.5,
+        "CENTERED": 1 / 4,
+        "BORING_CENTERED": 0.75,
         "FINISH_LINE": 0.05,
         "SAVING_DANGEROUS_SIDE": 0.05,
         "PANIC_RECENTERING": 0.05,
@@ -284,6 +284,16 @@ def clean_history(simulation_history: list[HistoryPoint],
         tags = set(history_point.tags or [])
         is_center = "CENTERED" in tags
         is_boring = "BORING_CENTERED" in tags
+        action_mask = history_point.output or []
+        left_active = bool(len(action_mask) > IDX_LEFT and action_mask[IDX_LEFT] > 0)
+        right_active = bool(len(action_mask) > IDX_RIGHT and action_mask[IDX_RIGHT] > 0)
+        forward_active = bool(len(action_mask) > IDX_FORWARD and action_mask[IDX_FORWARD] > 0)
+        backward_active = bool(len(action_mask) > IDX_BACKWARD and action_mask[IDX_BACKWARD] > 0)
+        lateral_active = left_active or right_active
+
+        if lateral_active:
+            kept.append(history_point)
+            continue
 
         if tags & protected_tags:
             kept.append(history_point)
@@ -295,6 +305,24 @@ def clean_history(simulation_history: list[HistoryPoint],
 
         if is_boring and boring_remaining <= min_boring_keep:
             kept.append(history_point)
+            continue
+
+        only_forward = forward_active and not lateral_active and not backward_active
+
+        if only_forward and history_point.reward < 150 and rand() < 0.05:
+            removed += 1
+            if is_center:
+                center_remaining -= 1
+            if is_boring:
+                boring_remaining -= 1
+            continue
+
+        if not (lateral_active or forward_active or backward_active) and rand() < 0.01:
+            removed += 1
+            if is_center:
+                center_remaining -= 1
+            if is_boring:
+                boring_remaining -= 1
             continue
 
         if (
@@ -603,6 +631,13 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         else:
             centering_factor = 0.0
 
+        if historyPoint.output:
+            steer_left = historyPoint.output[IDX_LEFT] if len(historyPoint.output) > IDX_LEFT else 0
+            steer_right = historyPoint.output[IDX_RIGHT] if len(historyPoint.output) > IDX_RIGHT else 0
+            if steer_left <= 0 and steer_right <= 0 and reward < -100:
+                delta = -100 - reward
+                reward = log_reward_update(reward, delta, "plancher sans direction latérale", tags)
+
         # if(abs(input_position_x) > abs(result_position_x)):
         #     delta = 5*result_z_speed
         #     reward = log_reward_update(reward, delta, "recentrage latéral")
@@ -611,7 +646,8 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         return finalize(reward, "cumul")
 import math
 import torch.optim as optim
-optimizer = optim.Adam(auto_pilot.parameters(), lr=1e-4)
+optimizer = optim.AdamW(auto_pilot.parameters(), lr=4e-5, weight_decay=1e-2)
+
 from torch.distributions import Bernoulli
 def get_action_log_probability(actions, logits):
     dist = Bernoulli(logits=logits)   
@@ -703,7 +739,7 @@ def train(simulation_history: list[HistoryPoint],
     if not simulation_history:
         logger.warning("⚠️ Impossible d'entraîner — historique vide.")
         return
-
+    clean_history(simulation_history)
     inputs = torch.stack([normalize_inputs(h.input) for h in simulation_history]).to(device)
     tries = torch.tensor([h.output for h in simulation_history], dtype=torch.float32, device=device)
     rewards = process_rewards(simulation_history)  # <---- nouvelle fonction ici
@@ -765,7 +801,7 @@ def train(simulation_history: list[HistoryPoint],
     save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
     logger.info(f"✅ Entraînement terminé — modèle final sauvegardé ({timestamp}).")
 
-    clean_history(simulation_history)
+    
 
 
 def load_simulation_from_file(path: str) -> list[HistoryPoint]:
@@ -846,7 +882,7 @@ def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") 
     return load_model_from_path(latest_path, model)
 
 # # # Chargement du modèle par défaut au démarrage
-# load_model_from_path(STARTUP_MODEL_PATH)
+load_model_from_path(STARTUP_MODEL_PATH)
 
 def train_from_file(directory: str = "sessions"):
     """
@@ -979,7 +1015,7 @@ async def maybe_send_positional_reset(
 async def websocket_endpoint(ws: WebSocket):
     global predictions_count, predictions_since_training
     await ws.accept()
-    prediction_seconds_before_learning = 60*8
+    prediction_seconds_before_learning = 120*8
     fps = 8
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     initial_reset_sent = False
@@ -1096,7 +1132,7 @@ IDX_LEFT, IDX_FORWARD, IDX_RIGHT, IDX_BACKWARD = 0, 1, 2, 3
 
 def choose_actions_tensor(logits: torch.Tensor,
                           frame,
-                          threshold: float = 0.4,
+                          threshold: float = 0.2,
                           device: torch.device = torch.device("cpu"),
                           frame_before_side = 800,
                           frame_before_interaction = 200) -> tuple[list[str], list[int]]:
