@@ -1,7 +1,9 @@
 import logging
 import random
+import math
 from contextlib import contextmanager
 from contextvars import ContextVar
+from collections import defaultdict
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,6 +72,18 @@ for _handler in logging.getLogger().handlers:
 # Ensure third-party loggers that don't inherit root filters still get `client_id`.
 for _third_party_logger in ("uvicorn", "uvicorn.error", "uvicorn.access", "watchfiles"):
     logging.getLogger(_third_party_logger).addFilter(ClientIDFilter())
+
+LOG_THROTTLE_FACTOR = 180
+_log_counters: dict[str, int] = defaultdict(int)
+
+
+def log_every(key: str, interval: int = LOG_THROTTLE_FACTOR) -> bool:
+    """Return True when the log associated with `key` should be emitted."""
+
+    count = _log_counters[key]
+    should_emit = (count % interval) == 0
+    _log_counters[key] = count + 1
+    return should_emit
 
 
 @contextmanager
@@ -147,7 +161,7 @@ class AutoPilot(nn.Module):
         return self.output_layer(x)
     
 input_size = 13  # 7 capteurs + 3 vitesses + 3 accélérations
-hidden_size = 128
+hidden_size = 256
 output_size = 4
 sensor_order = [
     "left45Ray",
@@ -167,6 +181,7 @@ class HistoryPoint:
     world_input: dict = field(default_factory=dict)
     world_result: dict = field(default_factory=dict)
     reward: float = 0.0
+    tags: list[str] = field(default_factory=list)
 
 auto_pilot = AutoPilot(input_size,hidden_size,output_size)
 auto_pilot.to(device)
@@ -212,6 +227,135 @@ def save_simulation_history(simulation_history, directory="sessions"):
         json.dump(serializable, f, indent=2, ensure_ascii=False)
 
     logger.info(f"💾 Simulation sauvegardée dans {path}")
+
+
+def clean_history(simulation_history: list[HistoryPoint],
+                  tag_probabilities: dict[str, float] | None = None,
+                  high_reward_prob: float = 0.02,
+                  min_keep_ratios: dict[str, float] | None = None,
+                  rng: random.Random | None = None) -> int:
+    """
+    Supprime probabilistiquement des points de l'historique selon leurs tags.
+    Retourne le nombre de points retirés.
+    """
+    if not simulation_history:
+        return 0
+
+    rand = rng.random if rng is not None else random.random
+    protected_tags = {"DANGEROUS_SIDE", "NEW_OFFROAD", "STILL_OFFROAD"}
+    default_probabilities: dict[str, float] = {
+        "CENTERED": 1 / 3,
+        "BORING_CENTERED": 0.5,
+        "FINISH_LINE": 0.05,
+        "SAVING_DANGEROUS_SIDE": 0.05,
+        "PANIC_RECENTERING": 0.05,
+        "PROGRESSING_CENTER": 0.33,
+        "STALLING_CENTERED": 0.5,
+        "LOW_FORWARD_SPEED": 0.20,
+    }
+    if tag_probabilities:
+        default_probabilities.update(tag_probabilities)
+
+    total = len(simulation_history)
+    center_total = sum(1 for hp in simulation_history if "CENTERED" in (hp.tags or []))
+    boring_total = sum(1 for hp in simulation_history if "BORING_CENTERED" in (hp.tags or []))
+    center_ratio_before = (center_total / total) * 100 if total else 0.0
+    boring_ratio_before = (boring_total / total) * 100 if total else 0.0
+    logger.info(
+        f"🧮 cleanHistory ratios avant: CENTERED={center_ratio_before:.1f}% "
+        f"BORING_CENTERED={boring_ratio_before:.1f}% (total={total})"
+    )
+    min_keep_defaults = {
+        "CENTERED": 0.15,
+        "BORING_CENTERED": 0.05,
+    }
+    if min_keep_ratios:
+        min_keep_defaults.update(min_keep_ratios)
+
+    min_center_keep = math.ceil(total * min_keep_defaults.get("CENTERED", 0.0))
+    min_boring_keep = math.ceil(total * min_keep_defaults.get("BORING_CENTERED", 0.0))
+    center_remaining = center_total
+    boring_remaining = boring_total
+
+    kept: list[HistoryPoint] = []
+    removed = 0
+
+    for history_point in simulation_history:
+        tags = set(history_point.tags or [])
+        is_center = "CENTERED" in tags
+        is_boring = "BORING_CENTERED" in tags
+
+        if tags & protected_tags:
+            kept.append(history_point)
+            continue
+
+        if is_center and not is_boring and center_remaining <= min_center_keep:
+            kept.append(history_point)
+            continue
+
+        if is_boring and boring_remaining <= min_boring_keep:
+            kept.append(history_point)
+            continue
+
+        if (
+            history_point.reward > 100
+            and "CENTERED" in tags
+            and "SKIDDING_SIDEWAYS" in tags
+        ):
+            removed += 1
+            if is_center:
+                center_remaining -= 1
+            if is_boring:
+                boring_remaining -= 1
+            continue
+
+        if history_point.reward > 50 and rand() < high_reward_prob:
+            removed += 1
+            if is_center:
+                center_remaining -= 1
+            if is_boring:
+                boring_remaining -= 1
+            continue
+
+        removal_probability = 0.0
+        for tag in tags:
+            prob = default_probabilities.get(tag)
+            if prob is None:
+                continue
+            if tag == "LOW_FORWARD_SPEED" and "CENTERED" in tags:
+                continue
+            removal_probability = max(removal_probability, prob)
+
+        if removal_probability > 0 and rand() < removal_probability:
+            removed += 1
+            if is_center:
+                center_remaining -= 1
+            if is_boring:
+                boring_remaining -= 1
+            continue
+
+        kept.append(history_point)
+
+    simulation_history[:] = kept
+    new_total = len(simulation_history)
+    new_center = sum(1 for hp in simulation_history if "CENTERED" in (hp.tags or []))
+    new_boring = sum(1 for hp in simulation_history if "BORING_CENTERED" in (hp.tags or []))
+    center_ratio_after = (new_center / new_total) * 100 if new_total else 0.0
+    boring_ratio_after = (new_boring / new_total) * 100 if new_total else 0.0
+
+    if new_total:
+        logger.info(
+            f"🧮 cleanHistory ratios après: CENTERED={center_ratio_after:.1f}% "
+            f"BORING_CENTERED={boring_ratio_after:.1f}% (total={new_total})"
+        )
+    else:
+        logger.info("🧮 cleanHistory ratios après: historique vide")
+
+    logger.info(
+        f"🧹 cleanHistory: removed {removed}/{total} points "
+        f"({100 * removed / total:.1f}%)"
+    )
+    return removed
 import threading
 def periodic_auto_save(simulation_history):
     """
@@ -236,16 +380,23 @@ def reward_emoji(value: float) -> str:
         return "😤"
     return "😐"
 
-def log_reward(value: float, reason: str) -> float:
+def log_reward(value: float, reason: str, tags: list[str] | None = None) -> float:
     emoji = reward_emoji(value)
-    logger.info(f"{emoji} Reward ({reason}): {value:.2f}")
+    if log_every("reward"):
+        tag_text = f" tags={tags}" if tags else ""
+        logger.info(f"{emoji} Reward ({reason}): {value:.2f}{tag_text}")
     return value
 
-def log_reward_update(current: float, delta: float, reason: str) -> float:
+def log_reward_update(current: float, delta: float, reason: str, tags: list[str] | None = None) -> float:
     new_value = current + delta
     emoji = reward_emoji(delta)
     total_emoji = reward_emoji(new_value)
-    logger.info(f"{emoji} Reward update ({reason}): {delta:+.2f} -> {total_emoji} total {new_value:.2f}")
+    if log_every("reward_update"):
+        tag_text = f" tags={tags}" if tags else ""
+        logger.info(
+            f"{emoji} Reward update ({reason}): {delta:+.2f} -> "
+            f"{total_emoji} total {new_value:.2f}{tag_text}"
+        )
     return new_value
 
 def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, frame_before_interaction:int ,frame_idx:int) -> float:
@@ -257,6 +408,25 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
 
         world_result = historyPoint.world_result
         world_input = historyPoint.world_input
+        tags: list[str] = []
+
+        def add_tag(tag: str, detail: str | None = None) -> None:
+            added = False
+            if tag not in tags:
+                tags.append(tag)
+                added = True
+            if added or detail:
+                detail_msg = f": {detail}" if detail else ""
+                if log_every(f"tag:{tag}", interval=LOG_THROTTLE_FACTOR):
+                    logger.info(f"🏷️ Tag {tag}{detail_msg}")
+
+        def finalize(value: float, reason: str) -> float:
+            historyPoint.tags = tags
+            if tags and log_every("tags_summary", interval=LOG_THROTTLE_FACTOR):
+                logger.info(f"🏷️ Tags cumulés: {tags}")
+            return log_reward(value, reason, tags)
+
+        historyPoint.tags = []
         
         position_result = world_result.get("positions", {}).get("car", {})
         position_input = world_input.get("positions", {}).get("car", {})
@@ -282,67 +452,163 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         reward = 0
         # Vérifie que les positions sont valides
         if not position_result or not position_input:
-            return log_reward(0.0, "positions invalides")
+            add_tag("INVALID_POSITIONS")
+            return finalize(0.0, "positions invalides")
         if frame_idx <= frame_before_interaction:
-            return log_reward(0.0, "début d'épisode")
+            add_tag("EPISODE_WARMUP")
+            return finalize(0.0, "début d'épisode")
         road_length = (road_size.get("depth",0) / 2) - 10 
         if(abs(result_position_z) > road_length):
-            return log_reward(100, "franchissement de la ligne d'arrivée")
+            add_tag("FINISH_LINE")
+            return finalize(100, "franchissement de la ligne d'arrivée")
         # Punition si la voiture est tombée sous la route
         if result_position_y < road_pos.get("y", 0):
-            return log_reward(-10 * abs(result_x_speed), "chute sous la route")
+            add_tag("FALLING_OFF_ROAD")
+            return finalize(-10 * abs(result_x_speed), "chute sous la route")
 
         
         # Si la voiture revient au début, c'est que la prédiction est mauvaise, on punit
         if(input_position_z > 5 and result_position_z < 1):
-            return log_reward(-100, "retour au départ")
+            add_tag("RETURN_TO_START")
+            return finalize(-100, "retour au départ")
         # Road width = 5 
         # Car Width = 1
         x_max = (road_width/2) - (car_width/2)
-        x_min = x_max/3
-        if(x_min < abs(input_position_x)):
-            logger.info("🔴🔴🔴🔴🔴🔴🔴🔴🔴🔴")
-        side_proximity_ration = min(abs(result_position_x) / x_max, 1)
+        x_min = x_max/3 if x_max else 0.0
+        high_x_speed_threshold = 1.0
+        boring_threshold = (x_min / 3) if x_min else 0.0
+        dangerous_threshold = (x_max * 0.9) if x_max else None
+
+        if x_min < abs(input_position_x) and log_every("danger_zone_alert", interval=LOG_THROTTLE_FACTOR):
+            logger.info("🔴🔴🔴 Zone dangereuse")
+        side_proximity_ratio = min(abs(result_position_x) / x_max, 1) if x_max else 1.0
+        slight_offset_ratio = min(abs(result_position_x) / x_min, 1.0) if x_min else 0.0
+
+        if dangerous_threshold is not None and abs(result_position_x) >= dangerous_threshold:
+            add_tag("DANGEROUS_SIDE")
+
+        if boring_threshold and abs(result_position_x) <= boring_threshold:
+            add_tag("CENTERED")
+            if abs(result_x_speed) < 0.1:
+                add_tag("BORING_CENTERED")
+
+        if x_min and abs(result_position_x) <= x_min and abs(result_x_speed) < 0.1 and abs(result_z_speed) < 0.05:
+            add_tag("STALLING_CENTERED")
+
+        if x_min and abs(result_position_x) < x_min and abs(result_x_speed) > high_x_speed_threshold:
+            add_tag("SKIDDING_SIDEWAYS")
+
+        if x_min and abs(result_position_x) >= x_min and (result_x_speed * result_position_x) > 0 and abs(result_x_speed) > high_x_speed_threshold:
+            add_tag("RUSHING_TO_EDGE")
+
+        if x_min and abs(input_position_x) > x_min and (result_x_speed * result_position_x) < 0 and abs(result_x_speed) > high_x_speed_threshold:
+            add_tag("PANIC_RECENTERING")
+
+        if (
+            boring_threshold
+            and abs(result_position_x) > boring_threshold
+            and (result_x_speed * result_position_x) > 0
+            and abs(result_x_speed) > 0.3
+        ):
+            add_tag("SIDE_SPEED_PENALTY")
+            offset_factor = max(slight_offset_ratio, 0.2)
+            delta = -15 * abs(result_x_speed) * offset_factor
+            reward = log_reward_update(reward, delta, "vitesse latérale vers le bord", tags)
+
+        # Si la voiture est très centrée mais quasi immobile sur X, on a déjà capturé BORING_CENTERED.
         # Si on était pas dehors mais que l'action fait sortir
         # alors on punit et on ajoute une punition proportionnel à l'engouement vers x
         if(abs(result_position_x) > x_max and abs(input_position_x) < x_max):
-            return log_reward(-100 - 10 * abs(result_position_x) - abs(input_position_x), "sortie de route")
+            add_tag("NEW_OFFROAD")
+            return finalize(-100 - 10 * abs(result_position_x) - abs(input_position_x), "sortie de route")
         # Si on était déjà dehors alors on punit et ajoute une proportionalité à l'engouement vers x
         if(abs(result_position_x) > x_max and abs(input_position_x) > x_max):
-            return log_reward(-10 - 10 * abs(result_position_x) - abs(input_position_x), "persistance hors route")
+            add_tag("STILL_OFFROAD")
+            return finalize(-10 - 10 * abs(result_position_x) - abs(input_position_x), "persistance hors route")
         # Si on était pas dans X et qu'on rentre dedans, alors on ajoute une punition avec une proportionnalité de l'engouement vers x
         if(abs(result_position_x)>x_min and abs(input_position_x) < x_min):
             delta = -(10 + 5 * (abs(result_position_x) - abs(input_position_x)))
-            reward = log_reward_update(reward, delta, "entrée zone dangereuse")
+            add_tag("ENTERING_DANGER_ZONE")
+            reward = log_reward_update(reward, delta, "entrée zone dangereuse", tags)
         # Si on se dirige vers x, et que de base on était dans la zone dangereuse
         # alors on punit de plus en plus qu'on s'approche du bord
         if(abs(result_position_x) > abs(input_position_x) and abs(input_position_x) > x_min):
-            delta = -55*result_z_speed * side_proximity_ration**3
-            reward = log_reward_update(reward, delta, "approche du bord")
+            add_tag("APPROACHING_EDGE")
+            delta = -55*result_z_speed * side_proximity_ratio**3
+            reward = log_reward_update(reward, delta, "approche du bord", tags)
         # Si on se pars de x, et que de base on était dans la zone dangereuse
         # alors on récompense proportionnellement à la proximité
         if(abs(result_position_x) < abs(input_position_x) and abs(input_position_x) > x_min):
-            delta = 20*result_z_speed * side_proximity_ration**2
-            reward = log_reward_update(reward, delta, "éloignement du bord")
+            add_tag("SAVING_DANGEROUS_SIDE")
+            delta = 20*result_z_speed * side_proximity_ratio**2
+            reward = log_reward_update(reward, delta, "éloignement du bord", tags)
+
+        if abs(result_position_x) > x_min and historyPoint.output:
+            steer_left = historyPoint.output[IDX_LEFT]
+            steer_right = historyPoint.output[IDX_RIGHT]
+            direction = -1 if result_position_x < 0 else 1
+            center_force = (steer_left - steer_right) * direction
+            proximity = side_proximity_ratio if x_max else 0.0
+            if center_force < 0:
+                delta = -20 * abs(center_force) * proximity
+                reward = log_reward_update(reward, delta, "appui vers le bord dangereux", tags)
+            elif center_force > 0:
+                delta = 15 * center_force * (proximity ** 0.5)
+                reward = log_reward_update(reward, delta, "appui vers le centre", tags)
 
         # Si on sort de la zone dangereuse on a un petit bonus
         if(abs(input_position_x) > x_min and abs(result_position_x) < x_min):
-            reward = log_reward_update(reward, 10, "sortie zone dangereuse")
+            add_tag("EXITING_DANGER_ZONE")
+            reward = log_reward_update(reward, 10, "sortie zone dangereuse", tags)
             
         
-        # Si on avance peu ou qu'on recule légèrement, on punit de 10
-        if(result_z_speed < 0.2 and result_z_speed >= -1):
-            reward = log_reward_update(reward, -10, "vitesse avant insuffisante")
+        # Punition forte en marche arrière, sinon légère si ça avance trop peu
+        if result_z_speed < 0:
+            add_tag("REVERSING")
+            delta = -30 * abs(result_z_speed) - 10
+            reward = log_reward_update(reward, delta, "marche arrière", tags)
+        elif result_z_speed < 0.2:
+            add_tag("LOW_FORWARD_SPEED")
+            reward = log_reward_update(reward, -10, "vitesse avant insuffisante", tags)
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
-        centric_reward = 30 * result_z_speed * (max(0,1 - abs(result_position_x) /(x_min)))
-        reward = log_reward_update(reward, centric_reward, "progression axiale")
+        centering_factor = 0.0
+        recentering_bonus = 0.0
+        progress_tag = None
+        if x_min:
+            centering_factor = max(0.0, 1 - abs(result_position_x) / x_min)
+            moving_closer = abs(result_position_x) < abs(input_position_x)
+            moving_away = abs(result_position_x) > abs(input_position_x)
+            centric_reward = 30 * result_z_speed * centering_factor
+            if centric_reward > 0 and moving_closer:
+                progress_tag = "PROGRESSING_CENTER"
+            if result_z_speed > 0 and moving_closer:
+                recentering_bonus = 10 * result_z_speed * max(0.0, 1 - abs(result_position_x) / (x_min * 2))
+            if centric_reward > 0 and not moving_closer:
+                centric_reward *= 0.2
+            x_speed_temper = max(0.0, 1.0 - min(abs(result_x_speed) / (high_x_speed_threshold * 2), 1.0))
+            tempered_reward = centric_reward * x_speed_temper
+            if tempered_reward != centric_reward:
+                add_tag("CENTER_SPEED_TEMPERED")
+            if x_min and abs(result_position_x) <= x_min and x_speed_temper < 1.0 and moving_away:
+                penalty_factor = 1.0 - x_speed_temper
+                lateral_penalty = -25 * abs(result_x_speed) * penalty_factor
+                add_tag("CENTER_DRIFT_PENALTY")
+                reward = log_reward_update(reward, lateral_penalty, "dérive latérale rapide au centre", tags)
+            reward = log_reward_update(reward, tempered_reward, "progression axiale", tags)
+            if recentering_bonus:
+                reward = log_reward_update(reward, recentering_bonus, "progression centrée", tags)
+            if progress_tag:
+                add_tag(progress_tag)
+        else:
+            centering_factor = 0.0
+
         # if(abs(input_position_x) > abs(result_position_x)):
         #     delta = 5*result_z_speed
         #     reward = log_reward_update(reward, delta, "recentrage latéral")
 
 
-        return log_reward(reward, "cumul")
+        return finalize(reward, "cumul")
 import math
 import torch.optim as optim
 optimizer = optim.Adam(auto_pilot.parameters(), lr=1e-4)
@@ -499,6 +765,8 @@ def train(simulation_history: list[HistoryPoint],
     save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
     logger.info(f"✅ Entraînement terminé — modèle final sauvegardé ({timestamp}).")
 
+    clean_history(simulation_history)
+
 
 def load_simulation_from_file(path: str) -> list[HistoryPoint]:
     """
@@ -512,9 +780,10 @@ def load_simulation_from_file(path: str) -> list[HistoryPoint]:
             hp = HistoryPoint(
                 input=item.get("input", []),
                 output=item.get("output", []),
-                world_input=item.get("world", {}),
-                world_result=item.get("result", {}),
-                reward=item.get("reward", 0.0)
+                world_input=item.get("world_input", item.get("world", {})),
+                world_result=item.get("world_result", item.get("result", {})),
+                reward=item.get("reward", 0.0),
+                tags=item.get("tags", []),
             )
             history_points.append(hp)
         logger.info(f"📂 Fichier chargé : {path} ({len(history_points)} transitions)")
@@ -576,8 +845,8 @@ def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") 
 
     return load_model_from_path(latest_path, model)
 
-# # Chargement du modèle par défaut au démarrage
-load_model_from_path(STARTUP_MODEL_PATH)
+# # # Chargement du modèle par défaut au démarrage
+# load_model_from_path(STARTUP_MODEL_PATH)
 
 def train_from_file(directory: str = "sessions"):
     """
@@ -651,6 +920,7 @@ async def send_control_message(
     client_id: str,
     driving_inputs: list[str],
     reward: float | None = None,
+    tags: list[str] | None = None,
 ) -> None:
     """Send driving instructions enriched with training metadata to the client."""
 
@@ -660,6 +930,8 @@ async def send_control_message(
     }
     if reward is not None:
         response["reward"] = reward
+    if tags is not None:
+        response["tags"] = tags
     await ws.send_json(response)
 
 
@@ -707,7 +979,7 @@ async def maybe_send_positional_reset(
 async def websocket_endpoint(ws: WebSocket):
     global predictions_count, predictions_since_training
     await ws.accept()
-    prediction_seconds_before_learning = 120
+    prediction_seconds_before_learning = 60*8
     fps = 8
     predictions_before_learning : int = int(prediction_seconds_before_learning * fps)
     initial_reset_sent = False
@@ -751,7 +1023,8 @@ async def websocket_endpoint(ws: WebSocket):
                 if sent:
                     continue
                 reward_value = simulation_history[-1].reward if simulation_history else 0.0
-                await send_control_message(ws, client_id, chosen, reward_value)
+                tags_value = simulation_history[-1].tags if simulation_history else []
+                await send_control_message(ws, client_id, chosen, reward_value, tags_value)
                 simulation_history.append(new_history_point)
         except Exception as e:
             save_simulation_history(simulation_history)
@@ -775,8 +1048,8 @@ def predict_actions(payload, simulation_history: list[HistoryPoint], i: int = 0)
         # Ceci est le résultat de la prédiction précédente
         simulation_history[-1].world_result = payload
         reward = compute_reward(simulation_history[-1], road_size= payload.get("roadSize"), car_size= payload.get("carSize"), frame_before_interaction=frame_before_interaction, frame_idx=frame)
-        # Log reward seulement toutes les 10 frames pour réduire le bruit        
-        if frame_idx % 1 == 0:
+        # Log reward seulement toutes les 30 frames pour réduire le bruit        
+        if frame_idx % (1 * LOG_THROTTLE_FACTOR) == 0:
             logger.info(f"👌Reward: {reward:.0f}👌")
         simulation_history[-1].reward = reward
     new_history_point = HistoryPoint()
@@ -802,8 +1075,8 @@ def predict_actions(payload, simulation_history: list[HistoryPoint], i: int = 0)
         chosen_names, action_mask = choose_actions_tensor(logits, threshold=0.2, device=device, frame=frame, frame_before_interaction=frame_before_interaction)
 
 
-    # Ne logger que toutes les 10 frames pour éviter un trop grand volume de logs
-    if frame_idx % 2 == 0:
+    # Ne logger que toutes les 60 frames pour éviter un trop grand volume de logs
+    if frame_idx % (2 * LOG_THROTTLE_FACTOR) == 0:
         # Affiche la position Z de la voiture (curr_z) — déplacé depuis compute_reward
         
         curr_z = float(payload.get("positions", {}).get("car", {}).get("z", 0.0))
@@ -814,7 +1087,7 @@ def predict_actions(payload, simulation_history: list[HistoryPoint], i: int = 0)
         # log normalized inputs            
     new_history_point.input = values
     new_history_point.output = action_mask  
-    if frame_idx % 3 == 0:
+    if frame_idx % (3 * LOG_THROTTLE_FACTOR) == 0:
         logger.info(f"Actions: {chosen_names}")
     return new_history_point,chosen_names
 
