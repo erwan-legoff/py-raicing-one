@@ -160,7 +160,7 @@ class AutoPilot(nn.Module):
 
         return self.output_layer(x)
     
-input_size = 13  # 7 capteurs + 3 vitesses + 3 accélérations
+input_size = 28  # 13 features courantes + 14 mémoire/agrégats
 hidden_size = 256
 output_size = 4
 sensor_order = [
@@ -229,6 +229,56 @@ def save_simulation_history(simulation_history, directory="sessions"):
     logger.info(f"💾 Simulation sauvegardée dans {path}")
 
 
+def classify_rewards(history_points: list[HistoryPoint]) -> dict[str, int]:
+    """Return counts of reward categories for logging purposes."""
+    categories = {
+        "neg_extreme": 0,
+        "neg_high": 0,
+        "neg_neutral": 0,
+        "neutral": 0,
+        "pos_neutral": 0,
+        "pos_high": 0,
+        "pos_extreme": 0,
+    }
+    for hp in history_points:
+        reward = float(getattr(hp, "reward", 0.0) or 0.0)
+        if reward <= -75:
+            categories["neg_extreme"] += 1
+        elif reward <= -15:
+            categories["neg_high"] += 1
+        elif reward < 0:
+            categories["neg_neutral"] += 1
+        elif reward <= 15:
+            categories["neutral"] += 1
+        elif reward < 75:
+            categories["pos_neutral"] += 1
+        elif reward < 150:
+            categories["pos_high"] += 1
+        else:
+            categories["pos_extreme"] += 1
+    return categories
+
+
+def log_reward_stats(label: str, total: int, stats: dict[str, int]) -> None:
+    """Emit a summary of reward distribution if data is available."""
+    if total <= 0:
+        logger.info(f"🧮 Stats rewards {label}: aucun point")
+        return
+    pct = {key: (value / total) * 100 for key, value in stats.items()}
+    logger.info(
+        "🧮 Stats rewards %s: neutral=%.1f%% | pos[+]=%.1f%% | pos[++]=%.1f%% | pos[+++]=%.1f%% | "
+        "neg[-]=%.1f%% | neg[--]=%.1f%% | neg[---]=%.1f%%",
+        label,
+        pct["neutral"],
+        pct["pos_neutral"],
+        pct["pos_high"],
+        pct["pos_extreme"],
+        pct["neg_neutral"],
+        pct["neg_high"],
+        pct["neg_extreme"],
+    )
+
+
 def clean_history(simulation_history: list[HistoryPoint],
                   tag_probabilities: dict[str, float] | None = None,
                   high_reward_prob: float = 0.02,
@@ -261,10 +311,8 @@ def clean_history(simulation_history: list[HistoryPoint],
     boring_total = sum(1 for hp in simulation_history if "BORING_CENTERED" in (hp.tags or []))
     center_ratio_before = (center_total / total) * 100 if total else 0.0
     boring_ratio_before = (boring_total / total) * 100 if total else 0.0
-    logger.info(
-        f"🧮 cleanHistory ratios avant: CENTERED={center_ratio_before:.1f}% "
-        f"BORING_CENTERED={boring_ratio_before:.1f}% (total={total})"
-    )
+    reward_stats_before = classify_rewards(simulation_history)
+    log_reward_stats("avant", total, reward_stats_before)
     min_keep_defaults = {
         "CENTERED": 0.15,
         "BORING_CENTERED": 0.05,
@@ -370,14 +418,9 @@ def clean_history(simulation_history: list[HistoryPoint],
     new_boring = sum(1 for hp in simulation_history if "BORING_CENTERED" in (hp.tags or []))
     center_ratio_after = (new_center / new_total) * 100 if new_total else 0.0
     boring_ratio_after = (new_boring / new_total) * 100 if new_total else 0.0
-
+    reward_stats_after = classify_rewards(simulation_history)
     if new_total:
-        logger.info(
-            f"🧮 cleanHistory ratios après: CENTERED={center_ratio_after:.1f}% "
-            f"BORING_CENTERED={boring_ratio_after:.1f}% (total={new_total})"
-        )
-    else:
-        logger.info("🧮 cleanHistory ratios après: historique vide")
+        log_reward_stats("après", new_total, reward_stats_after)
 
     logger.info(
         f"🧹 cleanHistory: removed {removed}/{total} points "
@@ -452,7 +495,7 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
             historyPoint.tags = tags
             if tags and log_every("tags_summary", interval=LOG_THROTTLE_FACTOR):
                 logger.info(f"🏷️ Tags cumulés: {tags}")
-            return log_reward(value, reason, tags)
+            return value
 
         historyPoint.tags = []
         
@@ -466,6 +509,10 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         result_right_sensor = world_result.get("sensors", {}).get("right45Ray", 0)
         # On inverse l’axe Z pour que avancer → reward positif
         result_z_speed = -float(world_result.get("speeds", {}).get("z", 0.0))
+        result_z_acceleration = -float(world_result.get("accelerations", {}).get("z", 0.0))
+
+        curr_z_speed = -float(world_input.get("speeds", {}).get("z", 0.0))
+        curr_z_acceleration = -float(world_input.get("accelerations", {}).get("z", 0.0))
         curr_y_speed = float(world_result.get("speeds", {}).get("y", 0.0))
         result_x_speed = float(world_result.get("speeds", {}).get("x", 0.0))
         road_pos = world_input.get("positions", {}).get("road", {})
@@ -501,6 +548,9 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
             return finalize(-100, "retour au départ")
         # Road width = 5 
         # Car Width = 1
+        min_z_speed = 4
+        fast_z_speed = 8
+        min_z_acceleration = 0.08
         x_max = (road_width/2) - (car_width/2)
         x_min = x_max/3 if x_max else 0.0
         high_x_speed_threshold = 1.0
@@ -517,7 +567,7 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
 
         if boring_threshold and abs(result_position_x) <= boring_threshold:
             add_tag("CENTERED")
-            if abs(result_x_speed) < 0.1:
+            if abs(result_x_speed) < 0.15:
                 add_tag("BORING_CENTERED")
 
         if x_min and abs(result_position_x) <= x_min and abs(result_x_speed) < 0.1 and abs(result_z_speed) < 0.05:
@@ -540,8 +590,8 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
         ):
             add_tag("SIDE_SPEED_PENALTY")
             offset_factor = max(slight_offset_ratio, 0.2)
-            delta = -15 * abs(result_x_speed) * offset_factor
-            reward = log_reward_update(reward, delta, "vitesse latérale vers le bord", tags)
+            acc_reward = -15 * abs(result_x_speed) * offset_factor
+            reward += acc_reward
 
         # Si la voiture est très centrée mais quasi immobile sur X, on a déjà capturé BORING_CENTERED.
         # Si on était pas dehors mais que l'action fait sortir
@@ -555,21 +605,21 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
             return finalize(-10 - 10 * abs(result_position_x) - abs(input_position_x), "persistance hors route")
         # Si on était pas dans X et qu'on rentre dedans, alors on ajoute une punition avec une proportionnalité de l'engouement vers x
         if(abs(result_position_x)>x_min and abs(input_position_x) < x_min):
-            delta = -(10 + 5 * (abs(result_position_x) - abs(input_position_x)))
+            acc_reward = -(10 + 5 * (abs(result_position_x) - abs(input_position_x)))
             add_tag("ENTERING_DANGER_ZONE")
-            reward = log_reward_update(reward, delta, "entrée zone dangereuse", tags)
+            reward += acc_reward
         # Si on se dirige vers x, et que de base on était dans la zone dangereuse
         # alors on punit de plus en plus qu'on s'approche du bord
         if(abs(result_position_x) > abs(input_position_x) and abs(input_position_x) > x_min):
             add_tag("APPROACHING_EDGE")
-            delta = -55*result_z_speed * side_proximity_ratio**3
-            reward = log_reward_update(reward, delta, "approche du bord", tags)
+            acc_reward = -55*result_z_speed * side_proximity_ratio**3
+            reward += acc_reward
         # Si on se pars de x, et que de base on était dans la zone dangereuse
         # alors on récompense proportionnellement à la proximité
         if(abs(result_position_x) < abs(input_position_x) and abs(input_position_x) > x_min):
             add_tag("SAVING_DANGEROUS_SIDE")
-            delta = 20*result_z_speed * side_proximity_ratio**2
-            reward = log_reward_update(reward, delta, "éloignement du bord", tags)
+            acc_reward = 20*result_z_speed * side_proximity_ratio**2
+            reward += acc_reward
 
         if abs(result_position_x) > x_min and historyPoint.output:
             steer_left = historyPoint.output[IDX_LEFT]
@@ -578,26 +628,26 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
             center_force = (steer_left - steer_right) * direction
             proximity = side_proximity_ratio if x_max else 0.0
             if center_force < 0:
-                delta = -20 * abs(center_force) * proximity
-                reward = log_reward_update(reward, delta, "appui vers le bord dangereux", tags)
+                acc_reward = -20 * abs(center_force) * proximity
+                reward += acc_reward
             elif center_force > 0:
-                delta = 15 * center_force * (proximity ** 0.5)
-                reward = log_reward_update(reward, delta, "appui vers le centre", tags)
+                acc_reward = 15 * center_force * (proximity ** 0.5)
+                reward += acc_reward
 
         # Si on sort de la zone dangereuse on a un petit bonus
         if(abs(input_position_x) > x_min and abs(result_position_x) < x_min):
             add_tag("EXITING_DANGER_ZONE")
-            reward = log_reward_update(reward, 10, "sortie zone dangereuse", tags)
+            reward += 10
             
         
         # Punition forte en marche arrière, sinon légère si ça avance trop peu
         if result_z_speed < 0:
             add_tag("REVERSING")
-            delta = -30 * abs(result_z_speed) - 10
-            reward = log_reward_update(reward, delta, "marche arrière", tags)
+            acc_reward = -30 * abs(result_z_speed) - 10
+            reward += acc_reward
         elif result_z_speed < 0.2:
             add_tag("LOW_FORWARD_SPEED")
-            reward = log_reward_update(reward, -10, "vitesse avant insuffisante", tags)
+            reward -= 10
 
         # On récompense par rapport à la vitesse en avant et donc on punit autant si il recule
         centering_factor = 0.0
@@ -622,25 +672,49 @@ def compute_reward(historyPoint: HistoryPoint, road_size:dict, car_size:dict, fr
                 penalty_factor = 1.0 - x_speed_temper
                 lateral_penalty = -25 * abs(result_x_speed) * penalty_factor
                 add_tag("CENTER_DRIFT_PENALTY")
-                reward = log_reward_update(reward, lateral_penalty, "dérive latérale rapide au centre", tags)
-            reward = log_reward_update(reward, tempered_reward, "progression axiale", tags)
+                reward += lateral_penalty
+            reward += tempered_reward
             if recentering_bonus:
-                reward = log_reward_update(reward, recentering_bonus, "progression centrée", tags)
+                reward += recentering_bonus
             if progress_tag:
                 add_tag(progress_tag)
         else:
             centering_factor = 0.0
+        acc_ponderation = 5
+        if(curr_z_speed<1):
+            acc_ponderation = 100
+        elif(curr_z_speed<2):
+            acc_ponderation = 50
+        elif(curr_z_speed<3):
+            acc_ponderation = 20
+        elif (curr_z_speed < 4):
+            acc_ponderation = 10
+        if(result_z_acceleration < min_z_acceleration):
+            if(curr_z_speed < min_z_speed):
+                acc_ponderation *= 100
+            elif(curr_z_speed < fast_z_speed):
+                acc_ponderation *= 10
+        
 
+        acc_reward = acc_ponderation * (result_z_acceleration - min_z_acceleration)
+        reward += torch.clamp(torch.tensor(acc_reward), min=-20.0, max=20.0).item()
+        if(curr_z_acceleration < min_z_acceleration and result_z_acceleration < min_z_acceleration):
+            reward -=10
+            if(result_z_speed < min_z_speed):
+                reward += 10*(result_z_speed-min_z_speed)
         if historyPoint.output:
             steer_left = historyPoint.output[IDX_LEFT] if len(historyPoint.output) > IDX_LEFT else 0
             steer_right = historyPoint.output[IDX_RIGHT] if len(historyPoint.output) > IDX_RIGHT else 0
             if steer_left <= 0 and steer_right <= 0 and reward < -100:
-                delta = -100 - reward
-                reward = log_reward_update(reward, delta, "plancher sans direction latérale", tags)
+                acc_reward = -100 - reward
+                reward += acc_reward
 
         # if(abs(input_position_x) > abs(result_position_x)):
         #     delta = 5*result_z_speed
         #     reward = log_reward_update(reward, delta, "recentrage latéral")
+
+        if "BORING_CENTERED" in tags and reward <= -20:
+            tags.remove("BORING_CENTERED")
 
 
         return finalize(reward, "cumul")
@@ -660,22 +734,42 @@ SPEED_MAX = 10.0
 ACCEL_MAX = 2.0
 
 def normalize_inputs(values: list[float]) -> torch.Tensor:
-    # 7 capteurs + 3 vitesses + 3 accélérations = 13 features
-    sensors = torch.tensor(values[:7])
-    speeds = torch.tensor(values[7:10])
-    accels = torch.tensor(values[10:13])
+    """Normalize raw features into [0,1]. Supports legacy (13) and extended (28) inputs."""
+    if len(values) < 13:
+        raise ValueError(f"Expected at least 13 features, got {len(values)}")
 
-    # Capteurs déjà positifs
+    sensors = torch.tensor(values[:7], dtype=torch.float32)
+    speeds = torch.tensor(values[7:10], dtype=torch.float32)
+    accels = torch.tensor(values[10:13], dtype=torch.float32)
+
     sensors = (sensors - SENSOR_MIN) / (SENSOR_MAX - SENSOR_MIN + 1e-8)
-    
-    # Vitesse et accel : map [-max, +max] → [0, 1]
     speeds = (speeds + SPEED_MAX) / (2 * SPEED_MAX + 1e-8)
     accels = (accels + ACCEL_MAX) / (2 * ACCEL_MAX + 1e-8)
 
-    # Fusionne tout
-    normalized = torch.cat([sensors, speeds, accels])
+    parts: list[torch.Tensor] = [sensors, speeds, accels]
 
-    # Clamp par sécurité
+    if len(values) == 28:
+        idx = 13
+        mem_prev = torch.tensor(values[idx:idx+2], dtype=torch.float32); idx += 2
+        mem_short = torch.tensor(values[idx:idx+2], dtype=torch.float32); idx += 2
+        mem_long = torch.tensor(values[idx:idx+2], dtype=torch.float32); idx += 2
+        action_feats = torch.tensor(values[idx:idx+6], dtype=torch.float32); idx += 6
+        ratio_feats = torch.tensor(values[idx:idx+3], dtype=torch.float32)
+
+        mem_prev = (mem_prev - SENSOR_MIN) / (SENSOR_MAX - SENSOR_MIN + 1e-8)
+        mem_short = (mem_short - SENSOR_MIN) / (SENSOR_MAX - SENSOR_MIN + 1e-8)
+        mem_long = (mem_long - SENSOR_MIN) / (SENSOR_MAX - SENSOR_MIN + 1e-8)
+
+        action_norm = ((action_feats + 1.0) * 0.5).clamp(0.0, 1.0)
+
+        ratio_clamped = torch.clamp(ratio_feats, -5.0, 5.0)
+        ratio_norm = (ratio_clamped + 5.0) / 10.0
+
+        parts.extend([mem_prev, mem_short, mem_long, action_norm, ratio_norm])
+    elif len(values) != 13:
+        raise ValueError(f"Unsupported input length {len(values)}")
+
+    normalized = torch.cat(parts)
     return torch.clamp(normalized, 0.0, 1.0)
 
 def process_rewards(simulation_history: list[HistoryPoint]) -> torch.Tensor:
@@ -696,7 +790,7 @@ def process_rewards(simulation_history: list[HistoryPoint]) -> torch.Tensor:
     )
 
     # 1️⃣ Clipping des extrêmes pour éviter explosions
-    rewards = torch.clamp(rewards, -50, 50)
+    rewards = torch.clamp(rewards, -200, 200)
 
     # 2️⃣ Mise à l’échelle douce [-1,1] via tanh
     rewards = torch.tanh(rewards / 20.0)
@@ -798,7 +892,7 @@ def train(simulation_history: list[HistoryPoint],
     logger.info("🖥️" * 30)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_model(auto_pilot, filename=f"autopilot_final_{timestamp}.pt")
+    save_model(auto_pilot, filename=f"autopilot_final_v4_{timestamp}.pt")
     logger.info(f"✅ Entraînement terminé — modèle final sauvegardé ({timestamp}).")
 
     
@@ -882,7 +976,7 @@ def load_latest_model(model: nn.Module = auto_pilot, directory: str = "models") 
     return load_model_from_path(latest_path, model)
 
 # # # Chargement du modèle par défaut au démarrage
-load_model_from_path(STARTUP_MODEL_PATH)
+# load_model_from_path(STARTUP_MODEL_PATH)
 
 def train_from_file(directory: str = "sessions"):
     """
@@ -944,7 +1038,7 @@ def save_model(model: nn.Module, directory: str = "models", filename: str | None
 
     if filename is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"autopilot_v2_{timestamp}.pt"
+        filename = f"autopilot_v4_{timestamp}.pt"
 
     path = os.path.join(directory, filename)
     torch.save(model.state_dict(), path)
@@ -1101,8 +1195,88 @@ def predict_actions(payload, simulation_history: list[HistoryPoint], i: int = 0)
     speed_values = [speeds.get(axis, 0.0) for axis in ("x", "y", "z")]
     accel_values = [accels.get(axis, 0.0) for axis in ("x", "y", "z")]
 
-            # 3️⃣ Fusion complète : [7 capteurs] + [3 vitesses] + [3 accels] = 13 features
-    values = sensor_values + speed_values + accel_values
+            # 3️⃣ Capteurs mémoire (frame précédente)
+    def fused_actions(output: list[float] | None) -> tuple[float, float]:
+        if not output:
+            return 0.0, 0.0
+        left = output[IDX_LEFT] if len(output) > IDX_LEFT else 0.0
+        forward = output[IDX_FORWARD] if len(output) > IDX_FORWARD else 0.0
+        right = output[IDX_RIGHT] if len(output) > IDX_RIGHT else 0.0
+        backward = output[IDX_BACKWARD] if len(output) > IDX_BACKWARD else 0.0
+        lateral = right - left
+        longitudinal = forward - backward
+        return lateral, longitudinal
+
+    def speed_ratio(world: dict | None) -> float:
+        if not world:
+            return 0.0
+        speeds_w = world.get("speeds", {})
+        z_speed = -float(speeds_w.get("z", 0.0))
+        x_speed = float(speeds_w.get("x", 0.0))
+        denom = max(abs(x_speed), 1e-3)
+        return z_speed / denom
+
+    def sensors_lr(world: dict | None) -> tuple[float, float]:
+        sensors_w = (world or {}).get("sensors", {})
+        return float(sensors_w.get("left45Ray", 0.0)), float(sensors_w.get("right45Ray", 0.0))
+
+    def aggregate_window(points: list[HistoryPoint]) -> tuple[tuple[float, float], tuple[float, float], float]:
+        if not points:
+            return (0.0, 0.0), (0.0, 0.0), 0.0
+        sum_left = sum_right = 0.0
+        sum_lat = sum_long = 0.0
+        sum_ratio = 0.0
+        count = 0
+        for hp in points:
+            left, right = sensors_lr(hp.world_input)
+            lat, longi = fused_actions(hp.output)
+            ratio = speed_ratio(hp.world_input)
+            sum_left += left
+            sum_right += right
+            sum_lat += lat
+            sum_long += longi
+            sum_ratio += ratio
+            count += 1
+        if count == 0:
+            return (0.0, 0.0), (0.0, 0.0), 0.0
+        return (
+            (sum_left / count, sum_right / count),
+            (sum_lat / count, sum_long / count),
+            sum_ratio / count,
+        )
+
+    prev_left = prev_right = 0.0
+    avg_left = avg_right = 0.0
+    long_left = long_right = 0.0
+    prev_act_lat = prev_act_long = 0.0
+    avg_act_lat = avg_act_long = 0.0
+    long_act_lat = long_act_long = 0.0
+    prev_ratio = avg_ratio = long_ratio = 0.0
+    if simulation_history:
+        prev_hp = simulation_history[-1]
+        prev_world_input = prev_hp.world_input or {}
+        prev_left, prev_right = sensors_lr(prev_world_input)
+        prev_act_lat, prev_act_long = fused_actions(prev_hp.output)
+        prev_ratio = speed_ratio(prev_world_input)
+
+        short_window = simulation_history[-10:-1]
+        (avg_left, avg_right), (avg_act_lat, avg_act_long), avg_ratio = aggregate_window(short_window)
+
+        long_window = simulation_history[-27:-10]
+        (long_left, long_right), (long_act_lat, long_act_long), long_ratio = aggregate_window(long_window)
+
+    memory_values = [
+        prev_left, prev_right,
+        avg_left, avg_right,
+        long_left, long_right,
+        prev_act_lat, prev_act_long,
+        avg_act_lat, avg_act_long,
+        long_act_lat, long_act_long,
+        prev_ratio, avg_ratio, long_ratio,
+    ]
+
+            # 4️⃣ Fusion complète : 13 features courantes + 14 mémoire = 28 features
+    values = sensor_values + speed_values + accel_values + memory_values
     normalized_input = normalize_inputs(values).unsqueeze(0).to(device)
     data_input = normalized_input
 
