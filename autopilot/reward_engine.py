@@ -125,6 +125,8 @@ class RewardEngine:
             x_max,
             curr_x,
             lateral_speed,
+            forward_speed_curr,
+            curr_x - prev_x,
             dt,
             tags,
         )
@@ -132,11 +134,27 @@ class RewardEngine:
             session,
             forward_speed_curr,
             speed_tendency,
+            x_max,
+            curr_x,
+            dt,
+            tags,
+        )
+        recenter_bonus = self._compute_recentering_bonus(
+            x_max,
+            prev_x,
+            curr_x,
+            forward_speed_curr,
+            tags,
+        )
+        center_penalty = self._compute_center_drift_penalty(
+            session,
+            x_max,
+            curr_x,
             dt,
             tags,
         )
 
-        total_reward = base_reward + pen_lateral + reward_speed
+        total_reward = base_reward + pen_lateral + reward_speed + recenter_bonus + center_penalty
         total_reward = float(torch.clamp(torch.tensor(total_reward), -200.0, 200.0).item())
         return RewardResult(total_reward, tags, done)
 
@@ -146,6 +164,8 @@ class RewardEngine:
         x_max: float,
         curr_x: float,
         lateral_speed: float,
+        forward_speed: float,
+        delta_x: float,
         dt: float,
         tags: list[str],
     ) -> float:
@@ -162,7 +182,10 @@ class RewardEngine:
             self._decay_lateral_counters(session, dt)
             return 0.0
 
-        horizon_warning = self._lateral_horizon(abs(lateral_speed))
+        speed_factor = max(0.5, min(abs(forward_speed) / max(self.speed_warn, 1e-3), 3.0))
+        horizon_warning = self._lateral_horizon(abs(lateral_speed)) / speed_factor
+
+        moving_to_center = (curr_x * delta_x) < 0
 
         if self.z_warn <= x_norm < self.z_danger:
             counter = f"time_in_warning_{side_name}"
@@ -188,20 +211,68 @@ class RewardEngine:
             severity = max(0.0, min(severity, 1.0))
             persistence = 1.0 + self.danger_alpha * current_value
             tendency = 1.0 + self.danger_beta * max(0.0, v_lat)
-            horizon_danger = self.lateral_fast_horizon if abs(lateral_speed) >= self.lateral_speed_fast_threshold else self.lateral_slow_horizon
+            base_horizon = self.lateral_fast_horizon if abs(lateral_speed) >= self.lateral_speed_fast_threshold else self.lateral_slow_horizon
+            horizon_danger = base_horizon / speed_factor
             time_progress = min(current_value / max(horizon_danger, 1e-6), 1.0)
             target = self.k_danger * severity * persistence * tendency
             penalty = -target * time_progress
             tags.append(f"LATERAL_DANGER_{side_name.upper()}")
 
+        if moving_to_center:
+            penalty *= 0.1
+
         penalty = max(-self.lateral_penalty_cap, min(0.0, penalty))
         return penalty
+
+    def _compute_center_drift_penalty(
+        self,
+        session: Session,
+        x_max: float,
+        curr_x: float,
+        dt: float,
+        tags: list[str],
+    ) -> float:
+        if x_max <= 1e-3:
+            return 0.0
+        x_norm = min(abs(curr_x) / x_max, 1.0)
+        if x_norm < self.z_warn:
+            session.center_drift_integral = max(0.0, session.center_drift_integral - dt * 0.5)
+            return 0.0
+        session.center_drift_integral += (x_norm - self.z_warn) * dt
+        penalty = -min(10.0, 2.5 * session.center_drift_integral)
+        if penalty < 0:
+            tags.append("CUM_CENTER_OFFSET")
+        return penalty
+
+    def _compute_recentering_bonus(
+        self,
+        x_max: float,
+        prev_x: float,
+        curr_x: float,
+        forward_speed: float,
+        tags: list[str],
+    ) -> float:
+        if x_max <= 1e-3:
+            return 0.0
+        prev_offset = abs(prev_x)
+        curr_offset = abs(curr_x)
+        if curr_offset >= prev_offset:
+            return 0.0
+        progress_ratio = (prev_offset - curr_offset) / max(prev_offset, 1e-3)
+        center_factor = max(0.0, 1.0 - curr_offset / x_max)
+        speed_factor = max(0.0, min(forward_speed / max(self.speed_warn, 1e-3), 3.0))
+        bonus = 8.0 * progress_ratio * center_factor * speed_factor
+        if bonus > 0:
+            tags.append("RECENTER_PROGRESS")
+        return bonus
 
     def _compute_speed_reward(
         self,
         session: Session,
         speed_curr: float,
         speed_tendency: float,
+        x_max: float,
+        curr_x: float,
         dt: float,
         tags: list[str],
     ) -> float:
@@ -211,6 +282,11 @@ class RewardEngine:
             reward = self.k_fast * (speed_curr - self.speed_warn)
             if speed_tendency > 0:
                 reward *= 1.0 + self.fast_gamma * speed_tendency
+            if x_max > 1e-3:
+                x_norm = min(abs(curr_x) / x_max, 1.0)
+                if x_norm > self.z_warn:
+                    excess = (x_norm - self.z_warn) / max(1.0 - self.z_warn, 1e-6)
+                    reward *= max(0.0, 1.0 - excess)
             tags.append("SPEED_GOOD")
             return reward
 

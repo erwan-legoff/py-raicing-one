@@ -34,6 +34,7 @@ class Session:
     time_in_danger_left: float = 0.0
     time_in_danger_right: float = 0.0
     time_in_slow: float = 0.0
+    center_drift_integral: float = 0.0
 
     def reset_episode(self) -> None:
         self.rollout_buffer.clear()
@@ -69,6 +70,7 @@ class Session:
         self.time_in_danger_left = 0.0
         self.time_in_danger_right = 0.0
         self.time_in_slow = 0.0
+        self.center_drift_integral = 0.0
 
 
 class SessionManager:
