@@ -1,7 +1,9 @@
 """Bridge between the WebSocket payloads and the RL core."""
 from __future__ import annotations
 
+import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import List
 
@@ -26,6 +28,7 @@ SENSOR_ORDER = [
 ]
 DRIVING_INPUTS = {0: "LEFT", 1: "FORWARD", 2: "RIGHT", 3: "BACKWARD"}
 NUM_FEATURES = 28
+LOGGER = logging.getLogger(__name__)
 
 
 class FeatureNormalizer:
@@ -90,6 +93,27 @@ class ObservationBuilder:
         return self.normalizer.normalize(tensor)
 
 
+class RewardNormalizer:
+    """Online normalization for rewards to keep magnitudes stable."""
+
+    def __init__(self, clip_value: float = 5.0) -> None:
+        self.clip_value = clip_value
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.count = 1e-4
+
+    def normalize(self, value: float) -> float:
+        self.count += 1.0
+        delta = value - self.mean
+        self.mean += delta / self.count
+        delta2 = value - self.mean
+        self.m2 += delta * delta2
+        variance = self.m2 / max(self.count - 1.0, 1.0)
+        std = max(variance, 1e-6) ** 0.5
+        normalized = (value - self.mean) / std
+        return float(max(-self.clip_value, min(self.clip_value, normalized)))
+
+
 @dataclass
 class ActionDecision:
     action_idx: int
@@ -141,6 +165,18 @@ class EnvironmentBridge:
         self.normalizer = FeatureNormalizer(NUM_FEATURES)
         self.obs_builder = ObservationBuilder(self.normalizer)
         self.action_selector = ActionSelector()
+        self.reward_normalizer = RewardNormalizer()
+        log_dir = os.path.join("sessions", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        self.session_log_path = os.path.join(
+            log_dir, f"session_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+        )
+        self.low_speed_threshold = 0.2
+        self.low_speed_limit = 96
+        self.stagnation_delta = 0.2
+        self.stagnation_limit = 160
+        self.reverse_limit = 64
+        self.forced_reset_penalty = -250.0
 
     def training_metadata(self) -> dict[str, object]:
         last_training_at = getattr(self.model, "last_training_at", None)
@@ -158,6 +194,9 @@ class EnvironmentBridge:
         tags: List[str] = []
         done = False
 
+        forced_reset = False
+        normalized_reward = 0.0
+        display_reward = 0.0
         if session.last_obs is not None and session.last_payload is not None and session.last_action_mask is not None:
             result = self.reward_engine.compute_reward(
                 session.last_payload,
@@ -166,16 +205,31 @@ class EnvironmentBridge:
                 payload.get("frameId", 0),
                 payload.get("roadSize"),
                 payload.get("carSize"),
+                session,
             )
             reward = result.reward
+            display_reward = reward
+            normalized_reward = self.reward_normalizer.normalize(reward)
             tags = result.tags
             done = result.done
+            reset_tag = None
+            if not done:
+                forced_reset, reset_tag, penalty = self._check_stall_reset(session, payload)
+                if forced_reset:
+                    done = True
+                    reward += penalty
+                    display_reward = reward
+                    normalized_reward = self.reward_normalizer.normalize(reward)
+                    tags = list(tags)
+                    if reset_tag:
+                        tags.append(reset_tag)
+
             transition = Transition(
                 obs=session.last_obs.detach(),
                 action_idx=session.last_action_idx or 0,
                 action_mask=session.last_action_mask,
                 log_prob=session.last_log_prob,
-                reward=reward,
+                reward=normalized_reward,
                 done=done,
                 value=session.last_value,
                 tags=tags,
@@ -184,7 +238,7 @@ class EnvironmentBridge:
             session.rollout_buffer.add(transition)
             session.episode_steps += 1
             session.episode_return += reward
-            session.last_reward = reward
+            session.last_reward = display_reward
             session.last_tags = tags
             if done:
                 if len(session.rollout_buffer) > 0:
@@ -194,12 +248,22 @@ class EnvironmentBridge:
                     session.evaluation_mode = (session.completed_episodes % 10) == 0
                 session.reset_episode()
                 session.clear_last_transition()
+                session.reset_stall_counters()
+                session.reset_reward_counters()
+                if not forced_reset:
+                    session.clear_forced_reset_streak()
                 session.last_reward = 0.0
                 session.last_tags = []
+                self._log_session_step(client_id, payload, display_reward, tags, done=True)
                 return self._build_message(["RESET"], reward, tags)
         else:
             session.last_reward = 0.0
             session.last_tags = []
+            session.reset_stall_counters()
+            session.reset_reward_counters()
+            if not forced_reset:
+                session.clear_forced_reset_streak()
+        self._log_session_step(client_id, payload, display_reward, tags, done=False)
 
         with torch.no_grad():
             logits, value = self.model(obs.unsqueeze(0).to(DEVICE))
@@ -227,3 +291,88 @@ class EnvironmentBridge:
             "tags": tags,
             "training": self.training_metadata(),
         }
+
+    def _log_session_step(self, client_id: str, payload: dict, reward: float, tags: list[str], done: bool) -> None:
+        frame = payload.get("frameId")
+        pos = (payload.get("positions") or {}).get("car", {})
+        with open(self.session_log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"{datetime.now(timezone.utc).isoformat()} client={client_id} frame={frame} "
+                f"pos=({pos.get('x'):.2f},{pos.get('z'):.2f}) reward={reward:.3f} "
+                f"tags={tags} done={done}\n"
+            )
+
+    def _check_stall_reset(self, session: Session, current_payload: dict) -> tuple[bool, str | None, float]:
+        prev_payload = session.last_payload
+        if not prev_payload:
+            session.reset_stall_counters()
+            return False, None, 0.0
+
+        prev_car = (prev_payload.get("positions") or {}).get("car") or {}
+        curr_car = (current_payload.get("positions") or {}).get("car") or {}
+        if not prev_car or not curr_car:
+            return False, None, 0.0
+
+        prev_z = float(prev_car.get("z", 0.0))
+        curr_z = float(curr_car.get("z", 0.0))
+        progress = prev_z - curr_z
+
+        if abs(progress) < self.stagnation_delta:
+            session.stagnation_steps += 1
+        else:
+            session.stagnation_steps = 0
+
+        if progress < -self.stagnation_delta:
+            session.reverse_steps += 1
+        else:
+            session.reverse_steps = 0
+
+        curr_z_speed = -float((current_payload.get("speeds") or {}).get("z", 0.0))
+        if curr_z_speed < self.low_speed_threshold:
+            session.low_speed_steps += 1
+        else:
+            session.low_speed_steps = 0
+
+        if session.low_speed_steps >= self.low_speed_limit:
+            session.reset_stall_counters()
+            session.register_forced_reset()
+            multiplier = 1.0 + 0.5 * (session.forced_reset_streak - 1)
+            penalty = self.forced_reset_penalty * multiplier
+            LOGGER.info(
+                "🔁 Forced RESET: low forward speed detected for %d frames (streak=%d, penalty=%.1f)",
+                self.low_speed_limit,
+                session.forced_reset_streak,
+                penalty,
+            )
+            return True, "FORCED_RESET_LOW_SPEED", penalty
+
+        if session.reverse_steps >= self.reverse_limit:
+            session.reset_stall_counters()
+            session.register_forced_reset()
+            multiplier = 1.0 + 0.5 * (session.forced_reset_streak - 1)
+            penalty = self.forced_reset_penalty * multiplier
+            LOGGER.info(
+                "🔁 Forced RESET: sustained backward motion detected for %d frames (streak=%d, penalty=%.1f)",
+                self.reverse_limit,
+                session.forced_reset_streak,
+                penalty,
+            )
+            return True, "FORCED_RESET_REVERSING", penalty
+
+        if session.stagnation_steps >= self.stagnation_limit:
+            session.reset_stall_counters()
+            session.register_forced_reset()
+            multiplier = 1.0 + 0.5 * (session.forced_reset_streak - 1)
+            penalty = self.forced_reset_penalty * multiplier
+            LOGGER.info(
+                "🔁 Forced RESET: no forward progress detected for %d frames (streak=%d, penalty=%.1f)",
+                self.stagnation_limit,
+                session.forced_reset_streak,
+                penalty,
+            )
+            return True, "FORCED_RESET_STALLED_Z", penalty
+
+        if progress > self.stagnation_delta * 2 or curr_z_speed > self.low_speed_threshold * 2:
+            session.decay_forced_reset_streak()
+
+        return False, None, 0.0

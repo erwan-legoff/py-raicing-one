@@ -72,7 +72,7 @@ def create_app() -> FastAPI:
 
     model = ActorCritic()
     startup_path = os.path.join("saved_models", "autopilot_v3_slow_20251102_164846.pt")
-    load_model(model, ModelPaths(startup_path=startup_path))
+    # load_model(model, ModelPaths(startup_path=startup_path))
 
     session_manager = SessionManager()
     trainer = Trainer(model)

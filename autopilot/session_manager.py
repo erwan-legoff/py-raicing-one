@@ -25,6 +25,15 @@ class Session:
     episode_return: float = 0.0
     completed_episodes: int = 0
     evaluation_mode: bool = False
+    low_speed_steps: int = 0
+    stagnation_steps: int = 0
+    forced_reset_streak: int = 0
+    reverse_steps: int = 0
+    time_in_warning_left: float = 0.0
+    time_in_warning_right: float = 0.0
+    time_in_danger_left: float = 0.0
+    time_in_danger_right: float = 0.0
+    time_in_slow: float = 0.0
 
     def reset_episode(self) -> None:
         self.rollout_buffer.clear()
@@ -38,6 +47,28 @@ class Session:
         self.last_action_mask = None
         self.last_log_prob = 0.0
         self.last_value = 0.0
+
+    def reset_stall_counters(self) -> None:
+        self.low_speed_steps = 0
+        self.stagnation_steps = 0
+        self.reverse_steps = 0
+
+    def register_forced_reset(self) -> None:
+        self.forced_reset_streak += 1
+
+    def clear_forced_reset_streak(self) -> None:
+        self.forced_reset_streak = 0
+
+    def decay_forced_reset_streak(self) -> None:
+        if self.forced_reset_streak > 0:
+            self.forced_reset_streak -= 1
+
+    def reset_reward_counters(self) -> None:
+        self.time_in_warning_left = 0.0
+        self.time_in_warning_right = 0.0
+        self.time_in_danger_left = 0.0
+        self.time_in_danger_right = 0.0
+        self.time_in_slow = 0.0
 
 
 class SessionManager:

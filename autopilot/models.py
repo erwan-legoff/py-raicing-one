@@ -87,10 +87,17 @@ class ModelPaths:
 def load_model(model: ActorCritic, paths: ModelPaths) -> None:
     """Load weights from disk if available."""
 
+    def _restore(checkpoint_path: str) -> None:
+        try:
+            state = torch.load(checkpoint_path, map_location=DEVICE)
+            model.load_state_dict(state)
+            model.to(DEVICE)
+        except (OSError, RuntimeError, ValueError) as exc:
+            # Keep training from scratch if we hit an incompatible checkpoint.
+            print(f"[autopilot] Skipping checkpoint '{checkpoint_path}': {exc}")
+
     if paths.startup_path and os.path.exists(paths.startup_path):
-        state = torch.load(paths.startup_path, map_location=DEVICE)
-        model.load_state_dict(state)
-        model.to(DEVICE)
+        _restore(paths.startup_path)
         return
 
     if not os.path.exists(paths.checkpoint_dir):
@@ -105,9 +112,7 @@ def load_model(model: ActorCritic, paths: ModelPaths) -> None:
         return
 
     checkpoints.sort(key=os.path.getmtime, reverse=True)
-    state = torch.load(checkpoints[0], map_location=DEVICE)
-    model.load_state_dict(state)
-    model.to(DEVICE)
+    _restore(checkpoints[0])
 
 
 def save_model(model: ActorCritic, paths: ModelPaths) -> str:

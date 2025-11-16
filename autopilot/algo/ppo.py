@@ -16,11 +16,11 @@ class PPOConfig:
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip_range: float = 0.2
-    lr: float = 1e-4
+    lr: float = 1.5e-4
     value_coef: float = 0.5
     entropy_coef: float = 0.01
-    batch_size: int = 4096
-    epochs: int = 4
+    batch_size: int = 1024
+    epochs: int = 6
     max_grad_norm: float = 0.5
 
 
